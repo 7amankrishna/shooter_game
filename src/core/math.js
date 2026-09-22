@@ -25,9 +25,30 @@ export function makeRng(seed = 1337) {
   };
 }
 
+/**
+ * Deterministic hash of integer coordinates (+ seed) → 32-bit int.
+ * This is what makes chunk content stable: the same chunk coords always roll
+ * the same layout, wherever and whenever the chunk is generated.
+ */
+export function hashCoords(x, y, seed = 0) {
+  let h = (seed >>> 0) ^ Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1);
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+/** Seeded RNG for one chunk / one tower cell — deterministic from coords. */
+export function coordsRng(seed, cx, cz) {
+  return makeRng(hashCoords(cx, cz, seed));
+}
+
 function hash2(x, y) {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
-  return s - Math.floor(s);
+  // integer hash — ~4x faster than the classic sin() trick and bit-exact
+  // across every machine, which matters because chunks regenerate on revisit.
+  let h = Math.imul(x | 0, 0x27d4eb2d) ^ Math.imul(y | 0, 0x165667b1);
+  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
 /** Cheap 2D value noise in [-1, 1]. */

@@ -1,26 +1,40 @@
 /**
  * ColliderWorld — a tiny, purpose-built physics broadphase.
  *
- * A general-purpose physics engine would be wasteful for an arena that is 95%
+ * A general-purpose physics engine would be wasteful for a world that is 95%
  * axis-aligned boxes, so we keep a flat list of AABBs in a uniform grid and
  * expose only the queries the game actually needs:
  *   1. `raycast()`        — bullets, line of sight, debris
- *   2. `moveBody()`       — vertical-cylinder sweep with wall sliding + step-up
+ *   2. `moveBody()`       — vertical-cylinder sweep with wall sliding + steps
  *   3. `groundHeightAt()` — terrain *plus* roofs/crates so props are walkable
  *
- * Hot paths allocate nothing but the result object and use a Set of already
- * tested box ids, which keeps a 100 m ray down to a few hundred slab tests.
+ * moveBody() implements proper slope physics (the fix for the old
+ * "launch into the air on higher terrain" bug):
+ *   • the ground can never teleport a body upward by more than a step height,
+ *     and never faster than `slopeClimbRate` — so climbing a hill is a smooth
+ *     ramp instead of a vertical snap;
+ *   • ground that rises faster than a body can climb is treated as a wall
+ *     (wall-slide, axis separated), which is exactly what a cliff face is;
+ *   • walking downhill glues the body to the ground within `snapDown`, so
+ *     slopes never turn into a chain of little hops;
+ *   • gravity is never accumulated while grounded — vertical velocity resets
+ *     on contact, so nothing floats, hovers or stores up launch energy.
+ *
+ * Boxes are owned (usually by a chunk key) so streamed chunks can remove their
+ * colliders without touching anyone else's.
  */
 import { rayAABB } from '../core/math.js';
 
 const CELL = 6;
 
 export class ColliderWorld {
-  constructor({ halfSize = 120, terrain = () => 0 } = {}) {
+  constructor({ halfSize = Infinity, terrain = () => 0 } = {}) {
     this.half = halfSize;
     this.terrain = terrain;
     this.boxes = [];
     this.grid = new Map();
+    this.freeIds = [];
+    this.byOwner = new Map();
     this.stats = { rayCalls: 0, boxTests: 0 };
   }
 
@@ -30,19 +44,26 @@ export class ColliderWorld {
 
   /** Adds an axis-aligned box from a centre + size. Returns the collider. */
   addBox(cx, cy, cz, sx, sy, sz, tag = 'solid', opts = {}) {
+    const id = this.freeIds.length ? this.freeIds.pop() : this.boxes.length;
     const box = {
-      id: this.boxes.length,
+      id,
       min: { x: cx - sx / 2, y: cy - sy / 2, z: cz - sz / 2 },
       max: { x: cx + sx / 2, y: cy + sy / 2, z: cz + sz / 2 },
       center: { x: cx, y: cy, z: cz },
       size: { x: sx, y: sy, z: sz },
       tag,
+      dead: false,
       walkable: opts.walkable !== false,
       cover: !!opts.cover,
       surface: opts.surface || 'concrete',
       owner: opts.owner || null,
     };
-    this.boxes.push(box);
+    this.boxes[id] = box;
+    if (box.owner) {
+      let arr = this.byOwner.get(box.owner);
+      if (!arr) this.byOwner.set(box.owner, (arr = []));
+      arr.push(box);
+    }
     const x0 = Math.floor(box.min.x / CELL);
     const x1 = Math.floor(box.max.x / CELL);
     const z0 = Math.floor(box.min.z / CELL);
@@ -56,6 +77,31 @@ export class ColliderWorld {
       }
     }
     return box;
+  }
+
+  /** Removes every collider registered with `owner` (chunk streaming). */
+  removeByOwner(owner) {
+    const list = this.byOwner.get(owner);
+    if (!list || !list.length) return 0;
+    for (const box of list) {
+      box.dead = true;
+      const x0 = Math.floor(box.min.x / CELL);
+      const x1 = Math.floor(box.max.x / CELL);
+      const z0 = Math.floor(box.min.z / CELL);
+      const z1 = Math.floor(box.max.z / CELL);
+      for (let gx = x0; gx <= x1; gx++) {
+        for (let gz = z0; gz <= z1; gz++) {
+          const arr = this.grid.get(this.key(gx, gz));
+          if (!arr) continue;
+          const i = arr.indexOf(box.id);
+          if (i >= 0) arr.splice(i, 1);
+        }
+      }
+      this.boxes[box.id] = null;
+      this.freeIds.push(box.id);
+    }
+    this.byOwner.delete(owner);
+    return list.length;
   }
 
   /** Convenience: bake an AABB collider from a (merged) mesh's bounds. */
@@ -101,6 +147,7 @@ export class ColliderWorld {
     const out = [];
     for (const id of this.boxIdsInXZ(minX, maxX, minZ, maxZ)) {
       const b = this.boxes[id];
+      if (!b || b.dead) continue;
       if (b.max.x < minX || b.min.x > maxX || b.max.z < minZ || b.min.z > maxZ) continue;
       if (filter && !filter(b)) continue;
       out.push(b);
@@ -112,7 +159,7 @@ export class ColliderWorld {
    * Closest solid hit along a ray. Grid cells are visited with an Amanatides &
    * Woo DDA walk so long rays never touch irrelevant geometry.
    */
-  raycast(origin, dir, maxDist = 200, { skipTags, stepOnly = false } = {}) {
+  raycast(origin, dir, maxDist = 200, { skipTags } = {}) {
     this.stats.rayCalls++;
     const skip = skipTags ? new Set(skipTags) : null;
     let best = null;
@@ -120,7 +167,6 @@ export class ColliderWorld {
 
     const testBox = (b) => {
       if (skip && skip.has(b.tag)) return;
-      if (stepOnly && b.tag !== 'trigger') return;
       this.stats.boxTests++;
       const d = rayAABB(origin, dir, b.min, b.max, maxDist);
       if (d < 0) return;
@@ -151,10 +197,13 @@ export class ColliderWorld {
     let guard = 0;
     while (guard++ < 4096) {
       const arr = this.grid.get(this.key(cx, cz));
-      if (arr) for (const id of arr) {
-        if (checked.has(id)) continue;
-        checked.add(id);
-        testBox(this.boxes[id]);
+      if (arr) {
+        for (const id of arr) {
+          if (checked.has(id)) continue;
+          checked.add(id);
+          const b = this.boxes[id];
+          if (b && !b.dead) testBox(b);
+        }
       }
       if (best && best.dist <= cellExit) break;
       if (tMaxX < tMaxZ) {
@@ -234,14 +283,13 @@ export class ColliderWorld {
     return !hit;
   }
 
-
   /** Ground elevation: terrain plus any walkable box top below `refY`. */
   groundHeightAt(x, z, refY = Infinity) {
     let h = this.terrain(x, z);
     const ids = this.boxIdsInXZ(x - 0.2, x + 0.2, z - 0.2, z + 0.2);
     for (const id of ids) {
       const b = this.boxes[id];
-      if (!b.walkable || b.tag === 'trigger') continue;
+      if (!b || b.dead || !b.walkable || b.tag === 'trigger') continue;
       if (x < b.min.x - 0.12 || x > b.max.x + 0.12 || z < b.min.z - 0.12 || z > b.max.z + 0.12) continue;
       if (b.max.y <= refY + 1e-3 && b.max.y > h) h = b.max.y;
     }
@@ -254,7 +302,7 @@ export class ColliderWorld {
     const ids = this.boxIdsInXZ(x - 0.3, x + 0.3, z - 0.3, z + 0.3);
     for (const id of ids) {
       const b = this.boxes[id];
-      if (b.tag === 'trigger' || b.walkable === false && b.tag === 'glass') continue;
+      if (!b || b.dead || b.tag === 'trigger' || (b.walkable === false && b.tag === 'glass')) continue;
       if (x < b.min.x || x > b.max.x || z < b.min.z || z > b.max.z) continue;
       if (b.min.y >= y - 0.02 && b.min.y < best) best = b.min.y;
     }
@@ -271,7 +319,7 @@ export class ColliderWorld {
     const ids = this.boxIdsInXZ(x - radius, x + radius, z - radius, z + radius);
     for (const id of ids) {
       const b = this.boxes[id];
-      if (b.tag === 'trigger') continue;
+      if (!b || b.dead || b.tag === 'trigger') continue;
       if (x + radius <= b.min.x || x - radius >= b.max.x || z + radius <= b.min.z || z - radius >= b.max.z) continue;
       const top = b.max.y;
       const bottom = b.min.y;
@@ -287,66 +335,101 @@ export class ColliderWorld {
   }
 
   /**
+   * True when a body with feet at `y` cannot stand at (x, z): either a box
+   * blocks the cylinder, or the ground there rises more than a step above the
+   * feet — a cliff or over-steep slope, which is exactly a wall.
+   */
+  #blockedAt(x, z, y, height, radius, stepHeight) {
+    const res = this.probeCylinder(x, z, y, height, radius, stepHeight);
+    if (res.blocked) return true;
+    const g = this.groundHeightAt(x, z, y + stepHeight + 0.001);
+    return g > y + stepHeight + 0.03;
+  }
+
+  /**
    * Sweeps a vertical-cylinder body through the world.
    * `pos` is mutated in place; the return value carries the resolved Y and flags.
+   *
+   * opts: radius, height, stepHeight, grounded (previous contact state),
+   * snapDown (downhill glue distance), climbRate (max upward ground correction
+   * per second — the anti-launch clamp).
    */
-  moveBody(pos, vel, dt, { radius = 0.4, height = 1.8, stepHeight = 0.62 } = {}) {
-    const out = { y: pos.y, grounded: false, landed: false, hitWall: false, stepped: false, hitCeiling: false };
+  moveBody(pos, vel, dt, { radius = 0.4, height = 1.8, stepHeight = 0.62, grounded = false, snapDown = 0.85, climbRate = 9 } = {}) {
+    const out = { y: pos.y, grounded: false, landed: false, hitWall: false, stepped: false, hitCeiling: false, fellFrom: 0 };
     const feet = pos.y;
+    const climbClamp = Math.max(stepHeight, climbRate * dt);
 
-    // ---- horizontal (with wall sliding) --------------------------------
-    const cand = { x: pos.x + vel.x * dt, z: pos.z + vel.z * dt };
-    let res = this.probeCylinder(cand.x, cand.z, feet, height, radius, stepHeight);
-    if (res.blocked) {
-      // try each axis on its own for sliding along walls
-      const onlyX = this.probeCylinder(cand.x, pos.z, feet, height, radius, stepHeight);
-      const onlyZ = this.probeCylinder(pos.x, cand.z, feet, height, radius, stepHeight);
-      if (!onlyX.blocked) {
-        pos.x = cand.x;
-        res = onlyX;
-        out.hitWall = true;
-      } else if (!onlyZ.blocked) {
-        pos.z = cand.z;
-        res = onlyZ;
-        out.hitWall = true;
-      } else {
-        out.hitWall = true;
-        res = { blocked: true, stepTop: -Infinity };
-      }
+    // ---- horizontal (wall sliding, axis separated) ----------------------
+    const nx = pos.x + vel.x * dt;
+    const nz = pos.z + vel.z * dt;
+    if (!this.#blockedAt(nx, nz, feet, height, radius, stepHeight)) {
+      pos.x = nx;
+      pos.z = nz;
+    } else if (!this.#blockedAt(nx, pos.z, feet, height, radius, stepHeight)) {
+      pos.x = nx;
+      out.hitWall = true;
+    } else if (!this.#blockedAt(pos.x, nz, feet, height, radius, stepHeight)) {
+      pos.z = nz;
+      out.hitWall = true;
     } else {
-      pos.x = cand.x;
-      pos.z = cand.z;
+      out.hitWall = true;
     }
-    if (res.stepTop > feet + 0.001) out.y = res.stepTop;
-    if (res.stepTop > -Infinity) out.stepped = true;
-
-    // clamp to arena
-    if (Math.abs(pos.x) > this.half) pos.x = Math.sign(pos.x) * this.half;
-    if (Math.abs(pos.z) > this.half) pos.z = Math.sign(pos.z) * this.half;
 
     // ---- vertical ---------------------------------------------------------
-    const support = this.groundHeightAt(pos.x, pos.z, feet + Math.max(stepHeight, 0.02) + 0.001);
-    const nextY = out.y + vel.y * dt;
+    // Support = terrain + walkable box tops reachable within a step above the
+    // feet. Anything higher was already rejected as a wall above.
+    let y = feet;
+    const support = this.groundHeightAt(pos.x, pos.z, feet + stepHeight + 0.001);
+    const nextY = y + vel.y * dt;
+
     if (vel.y <= 0) {
       if (nextY <= support + 1e-4) {
-        out.landed = out.y - support > 0.14;
-        out.y = support;
+        // contact: landing or walking up a slope/step
+        out.landed = feet - support < -0.12 || support - feet > 0.12;
+        y = support;
         out.grounded = true;
+      } else if (grounded && nextY - support <= snapDown) {
+        // walking downhill: stay glued to the ground within the snap distance
+        y = support;
+        out.grounded = true;
+        out.landed = support < feet - 0.2;
+      } else {
+        y = nextY;
+        out.grounded = false;
       }
     } else {
-      const ceil = this.ceilingHeightAt(pos.x, pos.z, out.y + height);
-      if (out.y + height + vel.y * dt > ceil) {
-        out.y = Math.max(support, ceil - height - 0.02);
+      // rising (jump): ballistic until the head touches a ceiling
+      y = nextY;
+      const ceil = this.ceilingHeightAt(pos.x, pos.z, y);
+      if (y + height > ceil) {
+        y = Math.max(support, ceil - height - 0.02);
         out.hitCeiling = true;
       }
     }
-    // keep from sinking through terrain when stationary
-    const hardFloor = this.groundHeightAt(pos.x, pos.z, pos.y + 0.05);
-    if (out.y < hardFloor) {
-      out.y = hardFloor;
+
+    // ---- anti-launch clamp ------------------------------------------------
+    // The ground may lift the body at most `climbClamp` per frame. A slope that
+    // demands more simply runs ahead of the body, and next frame the ground is
+    // above feet+step → treated as a wall. No vertical velocity is ever stored
+    // by ground contact, so nothing can accumulate into a launch.
+    if (y > feet + climbClamp) {
+      y = feet + climbClamp;
       out.grounded = true;
     }
-    pos.y = out.y;
+
+    // ---- safety: never end up buried under the terrain --------------------
+    const floor = this.terrain(pos.x, pos.z);
+    if (y < floor - 0.02) {
+      y = floor;
+      out.grounded = true;
+    }
+    if (Number.isFinite(this.half)) {
+      const lim = this.half;
+      if (Math.abs(pos.x) > lim) pos.x = Math.sign(pos.x) * lim;
+      if (Math.abs(pos.z) > lim) pos.z = Math.sign(pos.z) * lim;
+    }
+    out.y = y;
+    pos.y = y;
     return out;
   }
 }

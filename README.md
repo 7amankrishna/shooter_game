@@ -1,162 +1,127 @@
-# BLACKLINE // ARENA
+# BLACKLINE: DEADFALL
 
-A 3D first-person **1v1**: you against **one** AI combat machine, in a medium open-world
-arena, on one rifle, until somebody reaches 0 HP.
-
-Prototype-grade by design: one map, one weapon, one enemy, no networking, no vehicles —
-everything that is in there is tuned, and **every asset is procedural** (no downloads,
-no binary files). Three.js + Vite, ~900 kB bundled, 22 headless tests covering the sim.
+A survival-horror zombie shooter. You are dropped into an endless, procedurally
+generated deadland with a rifle, a sidearm and a marksman's bolt-action — scavenge,
+fight, earn coins, call in supply drops, climb watchtowers to breathe, and survive
+the night. **Every asset is procedural** (geometry, textures, audio cues, world):
+no downloads, no binary files. Three.js + Vite, one dependency.
 
 ```
 npm install
 npm run dev      # http://localhost:5173
-npm test         # 22 tests: logic, world generation, full match simulation, UI wiring
+npm test         # 33 headless tests: physics, world gen, AI, economy, full-run sim, UI
 npm run build    # production bundle in dist/
+npm run smoke    # Playwright browser test of the built game (needs `npx playwright install chromium`)
 ```
 
 ## The loop
 
-`MENU → DIFFICULTY → LOAD → SPAWN → SEARCH/DETECT → COMBAT → RESULTS → (Play Again | Change Difficulty | Main Menu)`
+```
+MENU → LOAD → EXPLORE → SCAVENGE → FIGHT → COINS → SUPPLY DROPS → NIGHT → ...
+                 ↳ climb a tower to regroup (safe zone, weapons hold)
+                 ↳ die → RUN SUMMARY → (Restart | Main Menu | Continue from autosave)
+```
 
-`Esc` pauses (Restart / Change difficulty / Quit resume the same loop). The machine spawns
-60–80 m away on purpose: the match opens with a search phase, and it ends the first time
-either side's health hits zero.
+Difficulty scales with **distance travelled, time survived, kills and darkness** —
+the further you push from the spawn clearing, the worse it gets. Death is permanent
+for a run; the autosave keeps your last standing state for a Continue.
 
-| Control | |
+## Controls
+
+| Input | Action |
 | --- | --- |
-| `W A S D` / arrows | move |
-| mouse | look (pointer lock; see fallback below) |
-| `LMB` | fire |
-| `RMB` | aim down sights — smoothed, never a snap |
-| `R` | reload (auto-reload also kicks in when the mag runs dry mid-trigger-pull) |
-| `Shift` | sprint (weapon swings out of the way, spread spikes) |
-| `Space` | jump |
-| `Ctrl` / `C` | crouch (steadier gun, smaller profile, slower) |
-| `Esc` | pause |
-| `F3` | perf overlay · `M` mute · `1/2/3` difficulty in menus |
+| **W A S D / Arrows** | Move (camera-relative, normalized diagonals) |
+| **Mouse** | Look · **LMB** fire (hold for auto) · **RMB** aim down sights |
+| **Shift** | Sprint (stamina) · **C / Ctrl** crouch · **Space** jump |
+| **R** | Reload · **1 / 2 / 3 / wheel** weapons |
+| **E** | Interact — climb towers, open crates, grab loot |
+| **B** | Supply-drop buy menu (coins) |
+| **Esc** | Close overlay / pause |
+| **F3** | Debug stats · **M** mute · **F6** admin panel (dev: time + weather) |
 
-**Pointer lock in an embedded preview:** browsers can refuse pointer lock inside an iframe.
-If it is refused the game keeps playing — raw mouse deltas plus an edge-assist turn zone in
-the outer 24 % of the window, and `Alt+←/→` for a precise turn. Nothing dead-ends.
+## What's in the box
 
-## Scoring (the whole point of the gunplay)
+**Player & physics** — heightfield terrain with proper slope physics (no launches,
+no hovering: gravity-first integration, step-up, downhill glue, cliff faces become
+walls), stamina/sprint/crouch, per-surface footsteps, landing dips, camera recoil
+and damage shake. Towers teleport-free: a 1-second climb transition, then a safe
+platform with slow health regen and a weapons hold.
 
-| Region | Points | Damage |
-| --- | --- | --- |
-| Head | **+100** | 100 (one-shot kill) |
-| Chest | +50 | 40 |
-| Lower / pelvis | +40 | 30 |
-| Arm | +25 | 20 |
-| Leg | +20 | 15 |
-| Graze (round passed within 0.5 m of armour) | +10 | 0 |
+**Weapons** — three def-driven firearms (P-92 sidearm, AK-01 carbine, M-700
+marksman): ballistic feel with recoil patterns, hip/ADS spread bloom, tracers,
+shell ejection, reload states, weapon switching with raise animations. Hit
+detection is limb-accurate: headshots, chest, limbs — with damage multipliers,
+stagger and physical death topples on the zombies.
 
-Hits chain: **combo multipliers** at streaks of 2 / 4 / 7 / 11 → ×1.5 / ×2 / ×2.5 / ×3, a
-**headshot streak** bonus, an **accuracy** bonus at ≥70 % over at least 8 shots, and
-,"+250 for the kill, +150 if that kill was a headshot, and a speed bonus of 4 points per second
-saved under the 240 s par. A miss starts a 3.2 s grace window: land
-inside it and the combo survives, otherwise it resets. Every hit pops floating score text at
-the impact point in world space (`+100 HEADSHOT`, `+50 BODY HIT`), and dying halves the payout
-so a loss still reports the marks you actually made.
+**Zombies** — five types (Walker, Runner, Brute, Crawler, Screamer) with distinct
+stats, silhouettes, gaits, vocals and payouts. A real perception model: vision
+cones with line-of-sight, hearing that routes gunshots/sprints/crate impacts to
+nearby zombies, an 8 Hz think tick over an FSM (idle → wander → investigate →
+chase → attack → search → dead). No omniscience — sneak, break line of sight, and
+they lose you. Screamers call the horde. Night narrows *their* sight less than
+yours.
 
-Damage and points are deliberately **decoupled** — a leg hit pays 20 and costs the machine 15,
-so "shoot for the head" is a real risk/reward decision rather than a strictly dominant choice.
+**World** — infinite deterministic chunk streaming (seeded), five blended biomes
+(forest / field / rocky / abandoned / dead), varied vegetation (trees, bushes,
+rocks, grass) with scale/rotation/density variation, ruins and structures, a
+winding road, watchtowers on a 168 m grid. Chunks generate and unload around you;
+no seams, no popping, no per-frame allocations.
 
-## The machine
+**Atmosphere** — full day/night cycle with graded sky, sun, fog and exposure
+(darker nights stay playable), weather system (clear / cloudy / fog / rain /
+storm / heavy fog) with slow blending and lightning + delayed thunder, and a
+rain field that follows the camera. Adaptive audio: explore/tension/chase/night
+music layers with cooldowns, 3D-positioned zombie vocals, footsteps, wind, rain.
 
-`src/ai/AIBrain.js` is a perception + FSM layer over `src/ai/AIMachine.js` (the body).
+**Economy** — coins per kill (type-based, night and headshot bonuses), four
+airdrop tiers (Basic / Medical / Weapon / Premium) that fall from the sky with a
+beacon, randomized loot tables with rarity, ammo/health pickups scattered in the
+world. Crates land loudly — the noise draws zombies.
 
-- **Perception:** `viewRange`, a `fovDeg` cone, real line-of-sight through the same collider
-  grid bullets use, plus **hearing** (gunshots carry ~1.75× the hearing radius, sprint
-  footsteps ~0.32×). Awareness accumulates over `acquireTime` and decays over `loseTime`, so
-  breaking contact buys you a reposition, not a rest.
-- **States:** `PATROL → INVESTIGATE → SEARCH → ENGAGE → IN_COVER → REPOSITION → FLANK →
-  RELOAD → RETREAT → DEAD`, evaluated on a 0.28 s cadence. It does not stand still: strafe
-  lines, periodic repositions, flanks on prolonged contact, cover on damage, and it tops its
-  magazine up in safety (but not after every single shot — that reads as a robot with a tick
-  counter).
-- **Gunnery:** a reaction delay before answering, an aim sight that physically slews onto you
-  (so its own movement and your direction changes cost it accuracy), grouping error resampled
-  *per burst*, muzzle climb that decays between bursts, finite magazine, reload time, a fire
-  range it will not exceed, and an `intentionalMiss` probability.
+**UI** — main menu with settings (sensitivity, FOV, invert-Y, screen shake,
+volumes, quality presets — persisted), controls screen, pause, death screen with
+run stats, loading progress. HUD: vitals, stamina, ammo + weapon slots, clock /
+phase / weather / threat, a compass with threat markers, coin counter, prompts
+("E — CLIMB TOWER"), notifications ("+25 HEALTH"), buy menu, admin panel.
 
-| | EASY · RECRUIT | MEDIUM · OPERATOR | HARD · WRAITH |
-| --- | --- | --- | --- |
-| reaction | 1.0 – 1.5 s | 0.5 – 0.8 s | 0.22 – 0.42 s |
-| hit rate at 20–30 m | ~40 % | ~62 % | ~75 % |
-| view / FOV | 42 m / 75° | 70 m / 100° | 96 m / 128° |
-| burst | 1–2 | 2–4 | 3–5 |
-| mag / reload | 20 / 3.6 s | 30 / 2.9 s | 30 / 2.5 s |
-| cover use | 0.18 | 0.6 | 0.85 |
-| flanking | 0.04 | 0.3 | 0.55 |
-
-HP is **100 on every difficulty**: difficulty changes decision quality and gun handling, not
-the size of the health bar. Hard mode is not an aimbot and the test suite enforces that
-(`tests/logic.test.mjs` asserts HARD still has a reaction delay, still misses, still reloads,
-and still moves at human speed).
-
-## The AK-01
-
-Procedural rifle + arms viewmodel (`src/weapons/RifleModel.js`): 30 / 120 rounds, 640 rpm,
-bolt-open reload 2.35 s vs 1.65 s tactical (magazine retained), mag-check on dry, per-shot bloom that decays,
-recoil pattern with randomised side-to-side, ADS from 2.6° hip spread down to 0.22°,
-sway that follows movement, bolt cycling, muzzle flash, tracers that *travel* (a segment
-moving down the ray, not a stretched quad), ejected brass that bounces off the ground with a
-ping, and reload/dry-fire/hit audio. The viewmodel renders in its own scene after a depth
-clear, so the barrel can never poke through a wall.
-
-## Arena
-
-`src/world/Environment.js` builds a ~216 m abandoned supply quarter — village block west,
-warehouse + container depot east, ruins north, shop row south, an elevated overlook deck at
-(58, 80) you can reach by stairs, roads bisecting the middle, perimeter berm at ±107 m. Close,
-medium and long sightlines all exist on purpose; **610 cover points** are derived from the
-collider volumes (hard cover needs ≥0.95 m of height above its base, and a cover point must
-face away from the threat to count). Terrain is an analytic heightfield (roads flattened,
-hills, a trench), and colliders are a uniform-grid AABB world (`src/physics/ColliderWorld.js`)
-with DDA ray queries — bullets, line-of-sight and the AI's body sweep all share it.
-
-## Performance
-
-- Static geometry merged per structure; props (trees, rocks, crates, barrels, fences…) in
-  instanced LOD families with zero-scale culling and a distance budget.
-- `CellCuller` hides whole 24 m blocks of buildings outside the frustum, and shadow casting is
-  distance-gated to `RENDER.shadowCasterRange` with the shadow map refreshed at ~10 Hz on a
-  4 m follow grid (the arena is static — a per-frame shadow pass would be wasted).
-- One shadow-casting light. Two static fills. No point lights except the muzzle flash.
-- Pooled particles / tracers / decals / shells; zero per-frame allocation in the hot path.
-- Adaptive pixel ratio: holds ~55 fps by scaling the framebuffer between 0.62× and the
-  device ratio (capped at 1.75) instead of dropping frames.
-- HUD writes to the DOM only when a value actually changes (per-field dirty cache).
-- `F3` shows fps, frame ms, draw calls, triangles, prop/LOD counts, live cell counts, particle
-  count, shadow casters, rays and box tests per frame, AI state/awareness/HP, and the current
-  resolution scale.
-
-## Layout
+## Architecture
 
 ```
-src/config/    GameConfig.js, DifficultyConfig.js        all tuning lives here
-src/core/      Engine, InputManager, AudioEngine, Fx, Textures, Geo, math
-src/physics/   Heightfield (terrain/roads), ColliderWorld (AABB grid + DDA)
-src/world/     Environment, NavGrid (A* bake), LODInstances (props, cell culling)
-src/player/    PlayerController (movement, camera, ADS, recoil, damage)
-src/weapons/   RifleModel, Weapon
-src/ai/        AIMachine (body), AIBrain (perception + FSM)
-src/game/      HitDetection, Scoring, Match (orchestrator)
-src/ui/        styles.css, HUD, Menu
-tests/         logic.test.mjs, sim.test.mjs, ui.test.mjs, stubDom.js
+src/
+  config/    GameConfig.js        — every tunable in one place (no magic numbers)
+  core/      Engine, InputManager, AudioEngine, Fx, RainField, Textures, Geo, math
+  physics/   Heightfield (terrain fns + chunk geometry), ColliderWorld (rays,
+             cylinder sweeps, wall slide, steps — the anti-launch physics)
+  world/     World (chunk streaming), Structures, LODInstances
+  player/    PlayerController     — movement, look, camera feel, towers
+  zombies/   Zombie (body + animation), ZombieAI (FSM + senses), ZombieManager
+             (pool, spawn director, noise routing, difficulty)
+  weapons/   Weapon (def-driven), Loadout, RifleModel (procedural viewmodels)
+  game/      Survival (state machine + wiring), HitDetection, Economy, DayNight,
+             Weather
+  ui/        HUD, Menu, styles.css
+  main.js    bootstrap: engine ↔ menu ↔ game, settings, admin DOM wiring
+tests/       stubDom.js (headless DOM) + logic / sim / ui suites
 ```
 
-`src/game/Match.js` is the only place combat state changes hands: it owns the tick order
-(weapon → player → camera sync → fire → AI → AI shot → scoring → FX → audio → win/loss) and
-emits `hit / miss / playerDamaged / results / phase / log / warn` for the UI to react to. The
-UI never mutates the simulation.
+Design rules the code holds itself to:
 
-## Testing note
+- **Config over constants** — all balance lives in `GameConfig.js`.
+- **No per-frame allocations** in the hot path; pooled zombies, particles, drops.
+- **Determinism from seeds** — same seed, same world, same loot rolls.
+- **Fix root causes** — the original hover/launch bug was solved in `moveBody`
+  (gravity-first integration + climb-rate clamp), not by teleport hacks.
+- **Headless-testable** — the whole game runs without a renderer; the sim suite
+  plays minutes of the real loop and asserts on behavior.
 
-`npm test` runs the whole game for thousands of fixed ticks **without a browser** — it builds
-the real arena, then asserts that the machine detects, closes distance, uses cover/flank/
-reposition, runs its magazine dry, hits *and* misses; that every body region maps to the
-designed points and damage; that a match reaches `WIN` through sustained rifle fire and `LOSE`
-through player death; that pause really freezes the sim; that generation is deterministic
-(same seed → identical collider hash); and that a full sim tick costs ≈0.15 ms, so rendering
-gets the rest of the frame.
+## Performance notes
+
+Chunk streaming with a 7×7 resident grid, merged grass geometry per chunk,
+cell-level culling, pooled everything, capped audio voices with distance culling,
+and a fixed 900-drop rain field driven by a single draw call. The headless
+performance smoke keeps 60 sim-seconds under a fraction of real time.
+
+## Credits
+
+Built on [three.js](https://threejs.org). Everything else — terrain, textures,
+weapon models, zombie bodies, audio cues, UI — generated in code.

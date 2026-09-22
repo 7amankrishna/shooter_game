@@ -20,6 +20,9 @@ const KEYS = {
   KeyC: 'crouch', ControlLeft: 'crouch', ControlRight: 'crouch',
   KeyR: 'reload',
   KeyF: 'focus',
+  Digit1: 'slot1', Digit2: 'slot2', Digit3: 'slot3', Digit4: 'slot4',
+  KeyE: 'interact',
+  KeyB: 'buymenu',
 };
 
 export class InputManager {
@@ -76,6 +79,10 @@ export class InputManager {
       this.pressed.add('pause');
     }
     if (e.code === 'F3') this.pressed.add('debug');
+    if (e.code === 'F6') {
+      this.pressed.add('admin');
+      e.preventDefault();
+    }
     if (e.code === 'KeyM') this.pressed.add('mute');
     if (e.code === 'AltLeft' || e.code === 'AltRight') this.keys.add('alt');
   };
@@ -109,7 +116,10 @@ export class InputManager {
   };
 
   _onMouseDown = (e) => {
-    if (e.button === 0) this.mouse.fire = true;
+    if (e.button === 0) {
+      this.mouse.fire = true;
+      this.pressed.add('fire');
+    }
     if (e.button === 2) this.mouse.ads = true;
     this.pressed.add('mousedown');
   };
@@ -195,6 +205,7 @@ export class InputManager {
     }
     const sens = this.sensitivity * (this.locked ? 1 : 0.85);
     const arrowLook = alt && !this.locked;
+    const wheel = this.wheel;
     const state = {
       lookDelta: { x: lookX * sens, y: lookY * sens },
       forward: this.keys.has('forward') && !arrowLook,
@@ -206,10 +217,19 @@ export class InputManager {
       crouch: this.keys.has('crouch'),
       fire: this.mouse.fire,
       ads: this.mouse.ads,
+      firePressed: this.pressed.has('fire'),
       reloadPressed: this.pressed.has('reload'),
       pausePressed: this.pressed.has('pause'),
       debugPressed: this.pressed.has('debug'),
       mutePressed: this.pressed.has('mute'),
+      slot1Pressed: this.pressed.has('slot1'),
+      slot2Pressed: this.pressed.has('slot2'),
+      slot3Pressed: this.pressed.has('slot3'),
+      slot4Pressed: this.pressed.has('slot4'),
+      interactPressed: this.pressed.has('interact'),
+      buymenuPressed: this.pressed.has('buymenu'),
+      adminPressed: this.pressed.has('admin'),
+      wheel,
       autoReload: true,
       locked: this.locked,
       moveLen: this.keys.has('forward') || this.keys.has('back') || this.keys.has('left') || this.keys.has('right') ? 1 : 0,

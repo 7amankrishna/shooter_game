@@ -13,7 +13,7 @@
  */
 import * as THREE from 'three';
 import { RENDER } from '../config/GameConfig.js';
-import { clamp, damp } from './math.js';
+import { clamp, damp, lerp } from './math.js';
 
 const SKY_VS = /* glsl */ `
   varying vec3 vDir;
@@ -151,7 +151,8 @@ export class Engine {
     this.fill = new THREE.DirectionalLight(0x7ea6c8, 0.42);
     this.fill.position.set(60, 40, 80);
     scene.add(this.fill);
-    scene.add(new THREE.AmbientLight(0x40484f, 0.5));
+    this.ambient = new THREE.AmbientLight(0x40484f, 0.5);
+    scene.add(this.ambient);
 
     // ------------------------------------------------- viewmodel scene
     this.vmScene = new THREE.Scene();
@@ -311,6 +312,57 @@ export class Engine {
     const info = r.info.render;
     this.perf.calls = info.calls;
     this.perf.tris = info.triangles;
+  }
+
+  /**
+   * Applies the combined day/night + weather atmosphere: sun, sky, fog,
+   * exposure, fills. `atm` fields: sunDir, sunColor, sunIntensity, skyTop,
+   * skyHorizon, skyBottom, hemiSky, hemiGround, hemiIntensity, fogColor,
+   * fogNear, fogFar, exposure, dim, flash.
+   */
+  applyEnvironment(atm) {
+    const dim = atm.dim ?? 1;
+    const flash = atm.flash ?? 0;
+    this.sunDir.copy(atm.sunDir);
+    this.sun.color.copy(atm.sunColor);
+    this.sun.intensity = atm.sunIntensity * dim + flash * 1.6;
+    this.hemi.color.copy(atm.hemiSky);
+    this.hemi.groundColor.copy(atm.hemiGround);
+    this.hemi.intensity = atm.hemiIntensity * dim + flash * 0.8;
+    this.ambient.intensity = 0.5 * dim + flash * 0.35;
+    this.fill.intensity = 0.42 * dim;
+    const fog = this.scene.fog;
+    fog.color.copy(atm.fogColor);
+    fog.near = atm.fogNear;
+    fog.far = atm.fogFar;
+    const u = this.skyMat.uniforms;
+    u.uTop.value.copy(atm.skyTop).multiplyScalar(lerp(1, 0.5, 1 - dim));
+    u.uHorizon.value.copy(atm.skyHorizon).multiplyScalar(lerp(1, 0.5, 1 - dim));
+    u.uBottom.value.copy(atm.skyBottom);
+    u.uSunColor.value.copy(atm.sunColor);
+    u.uSunDir.value.copy(atm.sunDir);
+    this.renderer.toneMappingExposure = (atm.exposure ?? 1.06) + flash * 0.25;
+    // the viewmodel light follows the mood so the gun never glows at night
+    this.vmKey.intensity = 0.75 + 1.45 * dim;
+  }
+
+  /**
+   * Culling + shadow budget for the streamed world: whole chunk groups are
+   * frustum-culled by the cell culler; distant chunks leave the shadow pass.
+   */
+  updateWorldCulling(world, camPos) {
+    const frustum = this.updateFrustum();
+    const cells = world.culler.update(frustum, camPos, RENDER.fogFar + 40);
+    const range2 = RENDER.shadowCasterRange * RENDER.shadowCasterRange;
+    let casters = 0;
+    for (const entry of world.culler.cells.values()) {
+      const near = entry.center.distanceToSquared(camPos) < range2;
+      for (const o of entry.objects) {
+        if (o.castShadow !== near) o.castShadow = near;
+        if (near) casters++;
+      }
+    }
+    return { cells, casters };
   }
 
   dispose() {
