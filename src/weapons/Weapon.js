@@ -7,24 +7,29 @@
  * muzzle along this vector".
  */
 import * as THREE from 'three';
-import { WEAPON, PLAYER } from '../config/GameConfig.js';
-import { createRifle, createArms, createMuzzleFlash } from './RifleModel.js';
+import { PLAYER } from '../config/GameConfig.js';
+import { createRifle, createSidearm, createMarksman, createArms, createMuzzleFlash } from './RifleModel.js';
 import { DEG, clamp, damp, lerp, rand, fbm } from '../core/math.js';
 import { getTexture } from '../core/Textures.js';
 
 const ADS_BLEND = 15; // spring rate for hip -> sights
 
 export class Weapon {
-  constructor({ audio, fx, materials, kick }) {
+  /**
+   * @param {object} def  one of GameConfig.WEAPONS.* — the weapon IS its data:
+   *                      magazine, cadence, spread, recoil, reload timeline.
+   */
+  constructor({ def, audio, fx, materials, kick }) {
+    this.def = def;
     this.audio = audio;
     this.fx = fx;
     this.kick = kick; // callback: kick(pitchDeg, yawDeg, rollDeg)
     this.state = {
-      mag: WEAPON.magSize,
-      reserve: WEAPON.reserveStart,
+      mag: def.magSize,
+      reserve: def.reserveStart,
       reloading: false,
       reloadT: 0,
-      reloadDuration: WEAPON.reloadTime,
+      reloadDuration: def.reloadTime,
       cooldown: 0,
       bloom: 0,
       adsT: 0,
@@ -43,7 +48,11 @@ export class Weapon {
     const gunMat = new THREE.MeshStandardMaterial({ color: 0x2f3237, roughness: 0.5, metalness: 0.8 });
     const furniture = new THREE.MeshStandardMaterial({ color: 0x50402f, roughness: 0.72, metalness: 0.1 });
     const dark = new THREE.MeshStandardMaterial({ color: 0x1c1f23, roughness: 0.4, metalness: 0.9 });
-    this.rifle = createRifle({ viewmodel: true, body: gunMat, grip: furniture, metal: dark });
+    const modelArgs = { viewmodel: true, body: gunMat, grip: furniture, metal: dark };
+    this.rifle =
+      this.def.model === 'sidearm' ? createSidearm(modelArgs) :
+      this.def.model === 'marksman' ? createMarksman(modelArgs) :
+      createRifle(modelArgs);
     this.arms = createArms();
     this.viewRoot = new THREE.Group();
     this.viewRoot.add(this.rifle);
@@ -57,13 +66,14 @@ export class Weapon {
     this.bolt = this.rifle.userData.bolt;
     this.dot = this.rifle.userData.dot;
 
-    // pose anchors — hip vs. ADS. Hand-tuned so the optic lands on screen centre.
-    this.hipPos = new THREE.Vector3(0.115, -0.108, -0.26);
-    this.hipRot = new THREE.Euler(0.02, -0.055, 0.02);
-    this.adsPos = new THREE.Vector3(0.0, -0.043, -0.19);
-    this.adsRot = new THREE.Euler(0, 0, 0);
-    this.sprintPos = new THREE.Vector3(0.17, -0.17, -0.12);
-    this.sprintRot = new THREE.Euler(0.34, 0.62, 0.42);
+    // pose anchors come from the model factory (sight line differs per weapon)
+    const p = this.rifle.userData.poses;
+    this.hipPos = new THREE.Vector3(...p.hipPos);
+    this.hipRot = new THREE.Euler(...p.hipRot);
+    this.adsPos = new THREE.Vector3(...p.adsPos);
+    this.adsRot = new THREE.Euler(...p.adsRot);
+    this.sprintPos = new THREE.Vector3(...p.sprintPos);
+    this.sprintRot = new THREE.Euler(...p.sprintRot);
 
     this.basePos = this.hipPos.clone();
     this.baseRot = this.hipRot.clone();
@@ -72,8 +82,8 @@ export class Weapon {
 
   reset() {
     Object.assign(this.state, {
-      mag: WEAPON.magSize,
-      reserve: WEAPON.reserveStart,
+      mag: this.def.magSize,
+      reserve: this.def.reserveStart,
       reloading: false,
       reloadT: 0,
       cooldown: 0,
@@ -108,7 +118,7 @@ export class Weapon {
 
   get spreadDeg() {
     const s = this.state;
-    const base = lerp(WEAPON.hipSpread, WEAPON.adsSpread, s.adsT);
+    const base = lerp(this.def.hipSpread, this.def.adsSpread, s.adsT);
     return base + s.bloom * (1 - s.adsT * 0.62);
   }
 
@@ -121,9 +131,9 @@ export class Weapon {
   tryFire(now, camera, moveFactor = 0) {
     const s = this.state;
     if (s.reloading || s.cooldown > 0) return null;
-    const interval = 60 / WEAPON.rpm;
+    const interval = 60 / this.def.rpm;
     if (s.mag <= 0) {
-      s.cooldown = WEAPON.emptyClickDelay;
+      s.cooldown = this.def.emptyClickDelay;
       this.audio.play('dryFire', { gain: 0.9 });
       return { empty: true };
     }
@@ -135,10 +145,10 @@ export class Weapon {
     const adsK = 1 - s.adsT * 0.55;
     const shotsInBurst = clamp(this._burst ?? (this._burst = 0), 0, 12);
     this._burst = shotsInBurst + 1;
-    const bloomAdd = WEAPON.spreadBloomPerShot * (1 + shotsInBurst * 0.12) * adsK;
+    const bloomAdd = this.def.spreadBloomPerShot * (1 + shotsInBurst * 0.12) * adsK;
     s.bloom = Math.min(6.5, s.bloom + bloomAdd);
-    const up = (WEAPON.recoilKickUp + rand(Math.random, -0.12, 0.16)) * adsK * (1 + moveFactor * 0.25);
-    const side = rand(Math.random, -1, 1) * WEAPON.recoilKickSide * adsK;
+    const up = (this.def.recoilKickUp + rand(Math.random, -0.12, 0.16)) * adsK * (1 + moveFactor * 0.25);
+    const side = rand(Math.random, -1, 1) * this.def.recoilKickSide * adsK;
     if (this.kick) this.kick(up, side, rand(Math.random, -0.25, 0.25) * adsK);
     this.anim.recoilPos.z += 0.055 + s.adsT * -0.01;
     this.anim.recoilPos.y += 0.012;
@@ -164,7 +174,7 @@ export class Weapon {
     const r = Math.sqrt(Math.random()) * spread;
     dir.addScaledVector(right, Math.cos(a) * r).addScaledVector(upv, Math.sin(a) * r).normalize();
 
-    this.audio.play('shotPlayer', { gain: 1, pitch: 0.97 + Math.random() * 0.06 });
+    this.audio.play(this.def.sound, { gain: 1, pitch: 0.97 + Math.random() * 0.06 });
     this.fx.muzzleFlash(origin, dir);
     this.fx.eject(origin.clone().addScaledVector(right, -0.12).addScaledVector(upv, -0.05), dir, right);
     this.audio.play('shell', { gain: 0.5, when: 0.05 });
@@ -184,13 +194,13 @@ export class Weapon {
   startReload(force = false) {
     const s = this.state;
     if (s.reloading) return false;
-    if (!force && s.mag === WEAPON.magSize) return false;
+    if (!force && s.mag === this.def.magSize) return false;
     if (s.reserve <= 0 && !force) return false;
     if (s.reserve <= 0) return false;
     s.reloading = true;
     s.reloadT = 0;
     s.tactical = s.mag > 0 && !force;
-    s.reloadDuration = s.tactical ? WEAPON.tacticalReloadTime : WEAPON.reloadTime;
+    s.reloadDuration = s.tactical ? this.def.tacticalReloadTime : this.def.reloadTime;
     this.audio.play('magOut', { gain: 0.9 });
     this.audio.play('bolt', { gain: 0.6, when: s.tactical ? 0.1 : 0.02 });
     this._magInDone = false;
@@ -199,7 +209,7 @@ export class Weapon {
 
   #finishReload() {
     const s = this.state;
-    const need = WEAPON.magSize - s.mag;
+    const need = this.def.magSize - s.mag;
     const take = Math.min(need, s.reserve);
     s.mag += take;
     s.reserve -= take;
@@ -219,7 +229,7 @@ export class Weapon {
     const s = this.state;
     s.cooldown = Math.max(0, s.cooldown - dt);
     if (s.cooldown <= 0) this._burst = 0;
-    s.bloom = Math.max(0, s.bloom - WEAPON.spreadRecoveryPerSecond * dt);
+    s.bloom = Math.max(0, s.bloom - this.def.spreadRecoveryPerSecond * dt);
     s.adsT = damp(s.adsT, state.adsWanted && !s.sprinting && !s.reloading ? 1 : 0, ADS_BLEND, dt);
     s.sprinting = state.sprinting;
 

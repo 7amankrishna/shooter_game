@@ -1,12 +1,11 @@
 /**
- * Menu — main menu, difficulty select, controls, pause and results screens.
+ * Menu — main menu, settings, controls, credits, pause and loading screens.
  *
- * Screens are declarative (a spec table + one builder) so the flow
- * MENU → DIFFICULTY → LOAD → … → RESULTS → PLAY AGAIN is just transitions, and
- * every screen stays keyboard navigable as well as clickable.
+ * Screens are declarative (one builder per screen) so the flow
+ * MENU → LOADING → PLAY ⇄ PAUSE → (death) → MENU stays keyboard navigable.
+ * Settings persist to localStorage and are applied live by main.js.
  */
-import { DIFFICULTIES, DIFFICULTY_ORDER } from '../config/DifficultyConfig.js';
-import { formatScore, formatTime, clamp } from '../core/math.js';
+import { clamp } from '../core/math.js';
 
 const CONTROLS = [
   ['W / ↑', 'Move forward'],
@@ -15,25 +14,67 @@ const CONTROLS = [
   ['D / →', 'Strafe right'],
   ['Mouse', 'Look / aim'],
   ['Left Mouse', 'Fire (hold for full-auto)'],
-  ['Right Mouse', 'Aim down sights — tighter group, zoom, slower move'],
+  ['Right Mouse', 'Aim down sights'],
   ['R', 'Reload'],
-  ['Shift', 'Sprint (cancels ADS)'],
+  ['1 / 2 / 3', 'Weapons (wheel also switches)'],
+  ['Shift', 'Sprint — loud, costs stamina'],
   ['Space', 'Jump'],
-  ['C', 'Crouch — smaller profile, quieter, slower'],
+  ['C / Ctrl', 'Crouch — quieter, slower'],
+  ['E', 'Interact — towers, caches, crates'],
+  ['B', 'Buy menu (spend coins on supply drops)'],
   ['Esc', 'Pause'],
-  ['F3', 'Perf overlay (draw calls, LOD buckets, ray stats)'],
+  ['F3', 'Perf overlay'],
+  ['F6', 'Dev panel (time / weather)'],
   ['M', 'Mute audio'],
-  ['Alt + Arrows', 'Turn with the keyboard (only when mouse capture is blocked)'],
+  ['Alt + Arrows', 'Turn with the keyboard (if mouse capture is blocked)'],
 ];
 
+const CREDITS = [
+  ['BLACKLINE: DEADFALL', 'A survival-horror prototype'],
+  ['', ''],
+  ['Engine', 'three.js — every asset procedural, nothing loaded'],
+  ['Audio', 'WebAudio synthesis — guns, weather and the dead'],
+  ['World', 'Infinite deterministic chunk streaming'],
+  ['', ''],
+  ['Built on', 'the BLACKLINE // ARENA 1v1 prototype'],
+];
+
+const SETTINGS_KEY = 'deadfall.settings';
+
+export const DEFAULT_SETTINGS = {
+  sensitivity: 1,
+  fov: 76,
+  invertY: false,
+  screenShake: true,
+  volumeMaster: 0.9,
+  volumeSfx: 0.9,
+  volumeMusic: 0.55,
+  quality: 'high',
+};
+
+export function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch { /* storage blocked */ }
+  return { ...DEFAULT_SETTINGS };
+}
+
+export function saveSettings(s) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  } catch { /* storage blocked */ }
+}
+
 export class Menu {
-  constructor({ root, handlers = {} }) {
+  constructor({ root, handlers = {}, settings = { ...DEFAULT_SETTINGS } }) {
     this.root = root;
     this.h = handlers;
-    this.difficulty = 'MEDIUM';
+    this.settings = settings;
     this.current = null;
     this.screens = {};
     this.#build();
+    this.show('main');
   }
 
   #el(tag, cls, parent, text) {
@@ -45,233 +86,171 @@ export class Menu {
   }
 
   #btn(label, cls, onClick, hint) {
-    const b = this.#el('button', `btn ${cls ?? ''}`.trim(), null);
-    b.labelEl = this.#el('span', '', b, label);
-    if (hint) b.hintEl = this.#el('span', 'k', b, hint);
-    b.type = 'button';
-    b.addEventListener('click', (e) => {
-      e.preventDefault();
-      onClick?.();
-    });
+    const b = this.#el('button', `btn ${cls ?? ''}`.trim());
+    this.#el('span', '', b, label);
+    if (hint) this.#el('span', 'k', b, hint);
+    if (onClick) b.addEventListener('click', onClick);
     return b;
   }
 
-  #screen(name, buildFn) {
-    const el = this.#el('div', 'screen', this.root);
-    el.dataset.screen = name;
-    const card = this.#el('div', 'card', el);
-    buildFn(card, el);
-    this.screens[name] = el;
-    return el;
+  #screen(name, cls = '') {
+    const s = this.#el('div', `screen ${cls}`.trim(), this.root);
+    s.dataset.screen = name;
+    this.screens[name] = s;
+    return s;
   }
 
   #build() {
-    /* ---------------- main ---------------- */
-    this.#screen('main', (card) => {
-      this.#el('h1', '', card, 'BLACKLINE');
-      this.#el('div', 'sub', card, 'ARENA // 1v1 COMBAT TRIAL');
-      this.#el('p', '', card,
-        'One rifle. One machine. An abandoned supply quarter with sightlines you have to earn. Read its footsteps, take the angle, and score the hits — headshots pay ten times what a leg does.');
-      const list = this.#el('div', 'menu-list', card);
-      list.appendChild(this.#btn('Play', 'primary', () => this.h.play?.(), 'ENTER'));
-      list.appendChild(this.#btn(`Difficulty · ${this.difficulty}`, '', () => {
-        this.h.difficulty?.();
-      }, 'ENTER'));
-      this.mainDifficultyRow = list.children[1];
-      list.appendChild(this.#btn('Controls', '', () => this.h.controls?.(), 'C'));
-      list.appendChild(this.#btn('Restart match', '', () => this.h.restart?.(), 'R'));
-      list.appendChild(this.#btn('Quit', 'danger', () => this.h.quit?.(), 'Q'));
-      this.#el('div', 'hint', card,
-        'Tip: the machine learns nothing, but it does hunt — breaking line of sight only buys you a reposition, not a rest.');
-      this.#el('div', 'hint', card, 'Mouse capture is used when the browser allows it. If it is blocked, the view still turns at the edge of the window.');
-    });
+    this.root.innerHTML = '';
+    this.root.className = 'menu-root';
 
-    /* ---------------- difficulty ---------------- */
-    this.#screen('difficulty', (card) => {
-      this.#el('h1', '', card, 'DIFFICULTY');
-      this.#el('div', 'sub', card, 'AI TACTICAL PROFILE');
-      const grid = this.#el('div', 'diff-grid', card);
-      this.diffCards = {};
-      for (const key of DIFFICULTY_ORDER) {
-        const cfg = DIFFICULTIES[key];
-        const btn = this.#el('button', 'diff', grid);
-        btn.type = 'button';
-        this.#el('div', 'key', btn, `${DIFFICULTY_ORDER.indexOf(key) + 1} · ${key}`);
-        this.#el('div', 't', btn, cfg.title);
-        this.#el('div', 'd', btn, cfg.blurb);
-        const bars = this.#el('div', 'bars', btn);
-        const metric = (label, value) => {
-          const row = this.#el('div', 'b', bars);
-          this.#el('div', '', row, label);
-          const track = this.#el('div', 't2', row);
-          this.#el('i', '', track).style.width = `${clamp(value, 0, 1) * 100}%`;
-        };
-        metric('REACTION', 1 - (cfg.reaction[0] + cfg.reaction[1]) / 2 / 1.6);
-        metric('ACCURACY', 1 - cfg.aimErrorDeg / 4);
-        metric('COVER USE', cfg.coverChance);
-        metric('AGGRESSION', cfg.aggression);
-        metric('MOVEMENT', (cfg.moveSpeed - 2) / 3);
-        bars.appendChild(this.#el('div', '', null, cfg.tagline)).style.cssText = 'margin-top:8px;color:rgba(200,226,238,.55);text-transform:none;font-size:10px;line-height:1.5';
-        btn.addEventListener('click', () => {
-          this.difficulty = key;
-          this.#reflectDifficulty();
-          this.h.pickDifficulty?.(key);
-        });
-        this.diffCards[key] = btn;
-      }
-      const row = this.#el('div', 'row-btns', card);
-      row.appendChild(this.#btn('Back', '', () => this.h.back?.(), 'ESC'));
-      this.#reflectDifficulty();
-    });
+    /* ------------------------------------------------------- main menu */
+    const main = this.#screen('main');
+    const titleWrap = this.#el('div', 'title-wrap', main);
+    this.#el('div', 'title-eyebrow', titleWrap, 'BLACKLINE');
+    this.#el('h1', 'title', titleWrap, 'DEADFALL');
+    this.#el('div', 'title-sub', titleWrap, 'THE OUTBREAK IS PROCEDURAL. YOUR DEATH IS PERMANENT.');
+    const nav = this.#el('div', 'menu-nav', main);
+    nav.appendChild(this.#btn('NEW RUN', 'primary', () => this.h.onPlay?.()));
+    this.continueBtn = this.#btn('CONTINUE', '', () => this.h.onContinue?.());
+    nav.appendChild(this.continueBtn);
+    nav.appendChild(this.#btn('SETTINGS', '', () => this.show('settings')));
+    nav.appendChild(this.#btn('CONTROLS', '', () => this.show('controls')));
+    nav.appendChild(this.#btn('CREDITS', '', () => this.show('credits')));
+    if (typeof window !== 'undefined' && window.quitAllowed) {
+      nav.appendChild(this.#btn('EXIT', '', () => this.h.onExit?.()));
+    }
+    this.#el('div', 'menu-foot', main, 'A PROCEDURAL SURVIVAL PROTOTYPE · MOUSE + KEYBOARD');
 
-    /* ---------------- controls ---------------- */
-    this.#screen('controls', (card) => {
-      this.#el('h1', '', card, 'CONTROLS');
-      this.#el('div', 'sub', card, 'FIELD DOCTRINE');
-      const table = this.#el('table', 'keys', card);
-      const body = this.#el('tbody', '', table);
-      for (const [k, v] of CONTROLS) {
-        const tr = this.#el('tr', '', body);
-        const td = this.#el('td', '', tr);
-        k.split(' / ').forEach((part, i) => {
-          if (i) td.appendChild(document.createTextNode(' / '));
-          const key = this.#el('kbd', '', td, part);
-          void key;
-        });
-        this.#el('td', '', tr, v);
-      }
-      this.#el('h2', '', card, 'Scoring');
-      this.#el('p', '', card,
-        'Head +100 · Chest +50 · Lower torso +40 · Arm +25 · Leg +20 · Graze +10. Consecutive hits raise the multiplier (×1.5 → ×3.0), headshot streaks and sustained accuracy pay flat bonuses, and a miss only breaks the combo if you do not land another hit within 3.2 seconds.');
-      this.#el('p', '', card,
-        'Damage is scored separately: head 100, chest 40, lower torso 30, arm 20, leg 15, graze 5. One clean headshot ends the match — which is why the machine keeps its armour angled at cover, not at you.');
-      const row = this.#el('div', 'row-btns', card);
-      row.appendChild(this.#btn('Back', '', () => this.h.back?.(), 'ESC'));
-    });
+    /* --------------------------------------------------------- settings */
+    const settings = this.#screen('settings');
+    this.#el('h2', 'screen-title', settings, 'SETTINGS');
+    const body = this.#el('div', 'settings-grid', settings);
+    this.#slider(body, 'MOUSE SENSITIVITY', 'sensitivity', 0.2, 3, 0.05);
+    this.#slider(body, 'FIELD OF VIEW', 'fov', 60, 100, 1, (v) => `${v}°`);
+    this.#slider(body, 'MASTER VOLUME', 'volumeMaster', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`);
+    this.#slider(body, 'EFFECTS VOLUME', 'volumeSfx', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`);
+    this.#slider(body, 'MUSIC VOLUME', 'volumeMusic', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`);
+    this.#toggle(body, 'INVERT Y AXIS', 'invertY');
+    this.#toggle(body, 'SCREEN SHAKE', 'screenShake');
+    this.#choice(body, 'QUALITY PRESET', 'quality', [
+      ['low', 'LOW'], ['medium', 'MEDIUM'], ['high', 'HIGH'],
+    ]);
+    settings.appendChild(this.#btn('BACK', 'back', () => this.show('main')));
 
-    /* ---------------- pause ---------------- */
-    this.#screen('pause', (card) => {
-      this.#el('h1', '', card, 'PAUSED');
-      this.#el('div', 'sub', card, 'MATCH SUSPENDED');
-      this.pauseInfo = this.#el('p', '', card, '');
-      const list = this.#el('div', 'menu-list', card);
-      list.appendChild(this.#btn('Resume', 'primary', () => this.h.resume?.(), 'ESC'));
-      list.appendChild(this.#btn('Restart match', '', () => this.h.restart?.(), 'R'));
-      list.appendChild(this.#btn('Change difficulty', '', () => this.h.difficulty?.(), 'D'));
-      list.appendChild(this.#btn('Controls', '', () => this.h.controls?.(), 'C'));
-      list.appendChild(this.#btn('Quit to main menu', 'danger', () => this.h.quit?.(), 'Q'));
-    });
+    /* --------------------------------------------------------- controls */
+    const controls = this.#screen('controls');
+    this.#el('h2', 'screen-title', controls, 'CONTROLS');
+    const list = this.#el('div', 'controls-list', controls);
+    for (const [k, v] of CONTROLS) {
+      const row = this.#el('div', 'controls-row', list);
+      this.#el('span', 'controls-key', row, k);
+      this.#el('span', 'controls-desc', row, v);
+    }
+    controls.appendChild(this.#btn('BACK', 'back', () => this.show('main')));
 
-    /* ---------------- results ---------------- */
-    this.#screen('results', (card) => {
-      const head = this.#el('div', 'headline', card, 'MATCH COMPLETE');
-      void head;
-      this.resOutcome = this.#el('div', 'outcome', card, 'VICTORY');
-      const grid = this.#el('div', 'stat-grid', card);
-      this.resStats = {};
-      const stat = (key, label, big = false) => {
-        const s = this.#el('div', `stat ${big ? 'big' : ''}`, grid);
-        this.#el('div', 'k', s, label);
-        const v = this.#el('div', 'v', s, '—');
-        this.resStats[key] = v;
-      };
-      stat('score', 'SCORE', true);
-      stat('accuracy', 'ACCURACY', true);
-      stat('headshots', 'HEADSHOTS');
-      stat('hits', 'HITS');
-      stat('misses', 'MISSES');
-      stat('shots', 'SHOTS FIRED');
-      stat('best', 'BEST COMBO');
-      stat('time', 'TIME');
-      stat('grazes', 'GRAZES');
-      this.resBreakdown = this.#el('div', 'breakdown', card);
-      const row = this.#el('div', 'row-btns', card);
-      row.appendChild(this.#btn('Play again', 'primary', () => this.h.playAgain?.(), 'ENTER'));
-      row.appendChild(this.#btn('Change difficulty', '', () => this.h.difficulty?.(), 'D'));
-      row.appendChild(this.#btn('Main menu', '', () => this.h.mainMenu?.(), 'ESC'));
-    });
+    /* ---------------------------------------------------------- credits */
+    const credits = this.#screen('credits');
+    this.#el('h2', 'screen-title', credits, 'CREDITS');
+    const credList = this.#el('div', 'credits-list', credits);
+    for (const [k, v] of CREDITS) {
+      const row = this.#el('div', 'credits-row', credList);
+      this.#el('span', 'credits-k', row, k);
+      this.#el('span', 'credits-v', row, v);
+    }
+    credits.appendChild(this.#btn('BACK', 'back', () => this.show('main')));
 
-    /* ---------------- loading ---------------- */
-    this.#screen('loading', (card, el) => {
-      el.style.backdropFilter = 'blur(2px)';
-      this.#el('h1', '', card, 'DEPLOYING');
-      this.#el('div', 'sub', card, 'OPEN WORLD BUILD');
-      this.loadBar = this.#el('div', 'bar2', card);
-      this.loadFill = this.#el('i', '', this.loadBar);
-      this.loadTask = this.#el('div', 'task', card, 'INITIALISING');
-      this.loadDetail = this.#el('p', '', card, 'Generating terrain, structures, nav mesh and cover volumes. No asset downloads — the whole quarter is procedural.');
-    });
+    /* ----------------------------------------------------------- pause */
+    const pause = this.#screen('pause', 'overlay-screen');
+    this.#el('h2', 'screen-title', pause, 'PAUSED');
+    const pnav = this.#el('div', 'menu-nav', pause);
+    pnav.appendChild(this.#btn('RESUME', 'primary', () => this.h.onResume?.()));
+    pnav.appendChild(this.#btn('RESTART RUN', '', () => this.h.onRestart?.()));
+    pnav.appendChild(this.#btn('QUIT TO MENU', '', () => this.h.onQuit?.()));
 
-    const brand = this.#el('div', 'brand', this.root, 'BLACKLINE PROTOTYPE · ONE MAP · ONE RIFLE · ONE MACHINE');
-    void brand;
+    /* --------------------------------------------------------- loading */
+    const loading = this.#screen('loading', 'overlay-screen');
+    this.#el('div', 'title-eyebrow', loading, 'BLACKLINE');
+    this.#el('h2', 'screen-title', loading, 'GENERATING THE DEAD ZONE');
+    this.loadLabel = this.#el('div', 'load-label', loading, 'carving terrain…');
+    const barWrap = this.#el('div', 'load-bar', loading);
+    this.loadFill = this.#el('div', 'load-fill', barWrap);
   }
 
-  #reflectDifficulty() {
-    for (const [key, el] of Object.entries(this.diffCards ?? {})) el.classList.toggle('sel', key === this.difficulty);
-    const label = this.mainDifficultyRow?.labelEl ?? this.mainDifficultyRow?.firstChild;
-    if (label && DIFFICULTIES[this.difficulty]) {
-      label.textContent = `Difficulty · ${this.difficulty} · ${DIFFICULTIES[this.difficulty].title}`;
+  /* -------------------------------------------------------- settings UI */
+
+  #slider(parent, label, key, min, max, step, fmt = (v) => v.toFixed(2).replace(/\.?0+$/, '')) {
+    const row = this.#el('div', 'settings-row', parent);
+    this.#el('span', 'settings-label', row, label);
+    const right = this.#el('div', 'settings-right', row);
+    const out = this.#el('span', 'settings-value', right, fmt(this.settings[key]));
+    const input = this.#el('input', 'settings-slider', right);
+    input.type = 'range';
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.value = String(this.settings[key]);
+    input.dataset.key = key;
+    input.addEventListener('input', () => {
+      const v = clamp(parseFloat(input.value), min, max);
+      this.settings[key] = v;
+      out.textContent = fmt(v);
+      this.h.onSettingsChange?.({ ...this.settings });
+      saveSettings(this.settings);
+    });
+    return input;
+  }
+
+  #toggle(parent, label, key) {
+    const row = this.#el('div', 'settings-row', parent);
+    this.#el('span', 'settings-label', row, label);
+    const right = this.#el('div', 'settings-right', row);
+    const btn = this.#btn(this.settings[key] ? 'ON' : 'OFF', 'toggle', () => {
+      this.settings[key] = !this.settings[key];
+      btn.firstChild.textContent = this.settings[key] ? 'ON' : 'OFF';
+      this.h.onSettingsChange?.({ ...this.settings });
+      saveSettings(this.settings);
+    });
+    right.appendChild(btn);
+    return btn;
+  }
+
+  #choice(parent, label, key, options) {
+    const row = this.#el('div', 'settings-row', parent);
+    this.#el('span', 'settings-label', row, label);
+    const right = this.#el('div', 'settings-right', row);
+    const group = this.#el('div', 'choice-group', right);
+    for (const [value, name] of options) {
+      const b = this.#btn(name, `choice${this.settings[key] === value ? ' active' : ''}`, () => {
+        this.settings[key] = value;
+        for (const el of group.children) el.classList.remove('active');
+        b.classList.add('active');
+        this.h.onSettingsChange?.({ ...this.settings });
+        saveSettings(this.settings);
+      });
+      group.appendChild(b);
     }
   }
 
-  setDifficulty(key) {
-    this.difficulty = key;
-    this.#reflectDifficulty();
-  }
+  /* ------------------------------------------------------------- flow */
 
   show(name) {
-    this.current = name;
-    for (const [key, el] of Object.entries(this.screens)) {
-      const on = key === name;
-      el.classList.toggle('on', on);
-      el.style.display = on ? 'flex' : 'none';
+    for (const k of Object.keys(this.screens)) {
+      this.screens[k].classList.toggle('active', k === name);
     }
-    if (name === 'difficulty') this.#reflectDifficulty();
+    this.current = name;
   }
 
-  hide() {
-    this.show(null);
+  setContinueVisible(visible) {
+    this.continueBtn.style.display = visible ? '' : 'none';
   }
 
-  setLoading(task, progress) {
-    if (this.loadTask) this.loadTask.textContent = task;
-    if (this.loadFill) this.loadFill.style.width = `${Math.round(progress * 100)}%`;
+  setLoadingProgress(p, label) {
+    if (this.loadFill) this.loadFill.style.width = `${clamp(p, 0, 1) * 100}%`;
+    if (label && this.loadLabel) this.loadLabel.textContent = label;
   }
 
-  setPauseInfo(text) {
-    if (this.pauseInfo) this.pauseInfo.textContent = text;
-  }
-
-  showResults(summary) {
-    const win = summary.outcome === 'WIN';
-    this.resOutcome.textContent = win ? 'TARGET NEUTRALISED' : 'PLAYER DOWN';
-    this.resOutcome.className = `outcome ${win ? 'win' : 'lose'}`;
-    const set = (k, v) => {
-      this.resStats[k].textContent = v;
-    };
-    set('score', formatScore(summary.score));
-    set('accuracy', `${Math.round(summary.accuracy * 100)}%`);
-    set('headshots', String(summary.headshots));
-    set('hits', String(summary.hits));
-    set('misses', String(summary.misses));
-    set('shots', String(summary.shots));
-    set('best', `×${summary.bestStreak}`);
-    set('time', formatTime(summary.elapsed));
-    set('grazes', String(summary.grazes ?? 0));
-    const bd = this.resBreakdown;
-    bd.innerHTML = '';
-    const line = (a, b) => {
-      const row = this.#el('div', 'line', bd);
-      this.#el('span', '', row, a);
-      this.#el('span', '', row, b);
-    };
-    line('DIFFICULTY', summary.difficulty ?? '—');
-    line('AI HEALTH REMAINING', `${summary.aiHealth ?? 0}%`);
-    line('YOUR HEALTH', String(summary.playerHealth ?? 0));
-    if (summary.killBonus) line('ELIMINATION BONUS', `+${formatScore(summary.killBonus)}`);
-    if (summary.speedBonus) line('SPEED BONUS', `+${formatScore(summary.speedBonus)}`);
-    line('SCORING', win ? 'FULL PAYOUT' : '50% PARTIAL PAYOUT');
-    if (!win) line('NOTE', 'Match lost — hits still scored at half value.');
-    this.show('results');
+  hideAll() {
+    this.show('__none__');
   }
 }

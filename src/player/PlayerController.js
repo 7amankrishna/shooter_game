@@ -8,9 +8,15 @@
  *   base pose (yaw/pitch from the mouse)
  *   + recoil (springs back, with a small permanent climb you must fight)
  *   + shake/bob/dip (decaying, ADS-damped)
+ *
+ * CONTROL FIX (the old inversion bug): at yaw = 0 the camera looks down −Z, so
+ * "forward" must map to (−sin yaw, −cos yaw) and "right" to (cos yaw, −sin yaw).
+ * The old code used +cos/+sin for forward — W moved the player *backward*
+ * relative to the view. Both mappings here are derived from the camera basis,
+ * so they can never disagree again.
  */
 import * as THREE from 'three';
-import { PLAYER, WEAPON, WORLD } from '../config/GameConfig.js';
+import { PLAYER, WEAPONS, WORLD } from '../config/GameConfig.js';
 import { DEG, clamp, damp, lerp, smoothstep } from '../core/math.js';
 
 export class PlayerController {
@@ -27,6 +33,7 @@ export class PlayerController {
     this.roll = 0;
     this.health = PLAYER.health;
     this.maxHealth = PLAYER.health;
+    this.stamina = PLAYER.staminaMax;
     this.alive = true;
     this.crouching = false;
     this.grounded = true;
@@ -40,9 +47,17 @@ export class PlayerController {
     this.landingDip = 0;
     this.damageCooldown = 0;
     this.moveSpeed = 0;
+    this.moved = 0;
+    this.distanceTravelled = 0;
+    this.inTower = false;
+    this.towerTransition = null;
+    this.fovBase = PLAYER.baseFov;
+    this.lookScale = 1;
+    this.screenShake = true;
     this._euler = new THREE.Euler(0, 0, 0, 'YXZ');
     this._tmp = new THREE.Vector3();
     this.lastDamageFrom = new THREE.Vector3();
+    this._airPeakY = 0;
   }
 
   reset(spawn) {
@@ -56,11 +71,16 @@ export class PlayerController {
     this.pitch = 0;
     this.roll = 0;
     this.health = PLAYER.health;
+    this.maxHealth = PLAYER.health;
+    this.stamina = PLAYER.staminaMax;
     this.alive = true;
     this.crouching = false;
+    this.inTower = false;
+    this.towerTransition = null;
     this.recoil.pitch = this.recoil.yaw = this.recoil.roll = 0;
     this.shake = 0;
     this.landingDip = 0;
+    this._airPeakY = y;
   }
 
   get eyeHeight() {
@@ -73,9 +93,9 @@ export class PlayerController {
 
   look(dx, dy, adsT, sprinting) {
     const sensScale = lerp(PLAYER.hipSensitivity, PLAYER.adsSensitivity, adsT) * (sprinting ? PLAYER.sprintSensitivity : 1);
-    const s = 0.0022 * sensScale;
+    const s = 0.0022 * sensScale * (this.lookScale || 1);
     this.yaw -= dx * s;
-    this.pitch -= dy * s;
+    this.pitch -= dy * s * (this.invertY ? -1 : 1);
     const limit = Math.PI / 2 - 0.02;
     this.pitch = clamp(this.pitch, -limit, limit);
   }
@@ -86,10 +106,11 @@ export class PlayerController {
     this.recoil.roll += rollDeg * DEG * 0.4;
     // a fraction of the climb sticks, so full-auto has to be pulled down
     this.pitch = clamp(this.pitch + pitchDeg * DEG * 0.3, -(Math.PI / 2 - 0.02), Math.PI / 2 - 0.02);
-    this.shake = Math.min(0.5, this.shake + 0.1);
+    if (this.screenShake) this.addShake(0.1);
   }
 
   addShake(amount) {
+    if (!this.screenShake) return;
     this.shake = Math.min(1.1, this.shake + amount);
   }
 
@@ -105,7 +126,14 @@ export class PlayerController {
   }
 
   heal(amount) {
+    const before = this.health;
     this.health = Math.min(this.maxHealth, this.health + amount);
+    return this.health - before;
+  }
+
+  /** Begin the tower climb/descent: input is suspended while transitioning. */
+  startTowerTransition(from, to, onDone) {
+    this.towerTransition = { t: 0, from: from.clone(), to: to.clone(), onDone };
   }
 
   update(dt, input) {
@@ -115,12 +143,46 @@ export class PlayerController {
       this.reset(this.lastSpawn ?? { x: 0, y: 0, z: 0 });
       return;
     }
+    this.lookScale = input.lookScale ?? 1;
+    this.invertY = !!input.invertY;
     const adsT = input.adsT ?? 0;
-    const sprinting = !!input.sprinting && !this.crouching && adsT < 0.25 && input.moveLen > 0.2;
+
+    // ---- tower climb/descent transition (look stays live, movement locked)
+    if (this.towerTransition) {
+      const tr = this.towerTransition;
+      tr.t += dt / 1.05;
+      const k = smoothstep(0, 1, clamp(tr.t, 0, 1));
+      this.position.x = lerp(tr.from.x, tr.to.x, k);
+      this.position.z = lerp(tr.from.z, tr.to.z, k);
+      this.position.y = lerp(tr.from.y, tr.to.y, k);
+      this.velocity.set(0, 0, 0);
+      this.grounded = true;
+      if (tr.t >= 1) {
+        this.towerTransition = null;
+        tr.onDone?.();
+      }
+      this.#poseCamera(dt, adsT, 0, false);
+      this.#updateFov(dt, adsT, input);
+      return { adsT, sprinting: false, moveSpeed: 0, grounded: true, pitch: this.pitch, transition: true };
+    }
+
+    const wantSprint = !!input.sprinting && !this.crouching && adsT < 0.25 && input.moveLen > 0.2 && this.stamina > 0.5;
+    // once emptied, stamina must recover above the threshold before sprinting again
+    if (this.stamina <= 0.01) this._exhausted = true;
+    if (this._exhausted && this.stamina > PLAYER.staminaMinToSprint) this._exhausted = false;
+    const sprinting = wantSprint && !this._exhausted;
     const crouch = !!input.crouch;
     this.crouching = crouch;
 
-    // ---- desired movement in yaw space
+    // ---- stamina
+    if (sprinting && this.grounded) {
+      this.stamina = Math.max(0, this.stamina - PLAYER.staminaDrain * dt);
+    } else {
+      const rate = input.moveLen > 0.1 ? PLAYER.staminaRegen * 0.65 : PLAYER.staminaRegen;
+      this.stamina = Math.min(PLAYER.staminaMax, this.stamina + rate * dt);
+    }
+
+    // ---- desired movement in yaw space (FIXED — see file header)
     let fx = 0;
     let fz = 0;
     if (input.forward) fz += 1;
@@ -134,13 +196,15 @@ export class PlayerController {
     }
     const sinY = Math.sin(this.yaw);
     const cosY = Math.cos(this.yaw);
-    const wishX = fx * cosY + fz * sinY;
-    const wishZ = -fx * sinY + fz * cosY;
+    // forward = (−sin, −cos), right = (cos, −sin) — the camera basis in XZ
+    const wishX = fx * cosY - fz * sinY;
+    const wishZ = -fx * sinY - fz * cosY;
 
     let maxSpeed = PLAYER.maxSpeed;
     if (sprinting) maxSpeed = PLAYER.sprintSpeed;
     else if (adsT > 0.5) maxSpeed = PLAYER.adsSpeed;
     if (this.crouching) maxSpeed = Math.min(maxSpeed, PLAYER.crouchSpeed);
+    if (this.stamina < 25) maxSpeed *= 0.92; // winded
     if (!this.grounded) maxSpeed *= 1.02;
 
     const accel = this.grounded ? PLAYER.accelGround : PLAYER.accelAir;
@@ -169,30 +233,45 @@ export class PlayerController {
     if (input.jump && this.grounded && !this.crouching) {
       this.velocity.y = PLAYER.jumpVelocity;
       this.grounded = false;
+      this._airPeakY = this.position.y;
       this.audio?.play('step', { gain: 0.35, pitch: 1.35 });
     }
     this.velocity.y += WORLD.gravity * dt;
     if (this.velocity.y < -55) this.velocity.y = -55;
+    if (!this.grounded) this._airPeakY = Math.max(this._airPeakY, this.position.y);
 
     // ---- collide + resolve
     const height = this.crouching ? PLAYER.crouchHeight : PLAYER.height;
     this.prevPos.copy(this.position);
+    const vyBefore = this.velocity.y;
     const move = this.env.world.moveBody(this.position, this.velocity, dt, {
       radius: PLAYER.radius,
       height,
       stepHeight: PLAYER.stepHeight,
+      grounded: this.grounded,
+      snapDown: PLAYER.snapDown,
+      climbRate: PLAYER.slopeClimbRate,
     });
     if (move.grounded) {
       if (!this.grounded) {
-        const fall = Math.abs(this.velocity.y);
+        const fall = Math.abs(vyBefore);
         this.landingDip = clamp(fall * 0.02, 0.02, PLAYER.landingDip);
         this.addShake(clamp(fall * 0.012, 0, 0.18));
         if (fall > 3) {
           this.audio?.play('land', { gain: clamp(fall / 16, 0.2, 1) });
           this.fx?.footstep(this.position, { dust: fall > 7 });
         }
+        // fall damage: measured by impact speed, so hopping is always free
+        if (fall > PLAYER.fallDamageMinSpeed) {
+          const dmg = (fall - PLAYER.fallDamageMinSpeed) * PLAYER.fallDamageScale;
+          if (dmg > 1) {
+            this.takeDamage(dmg, null);
+            input.onFallDamage?.(dmg);
+          }
+        }
       }
       this.grounded = true;
+      // ground contact owns vertical velocity — nothing accumulates, ever
       this.velocity.y = 0;
     } else {
       this.grounded = false;
@@ -201,6 +280,7 @@ export class PlayerController {
 
     this.moveSpeed = Math.hypot(this.position.x - this.prevPos.x, this.position.z - this.prevPos.z) / Math.max(dt, 1e-4);
     this.moved = Math.hypot(this.position.x - this.prevPos.x, this.position.z - this.prevPos.z);
+    this.distanceTravelled += this.moved;
 
     // ---- footsteps (sound + dust); rate follows actual ground speed
     if (this.grounded && this.moveSpeed > 0.7) {
@@ -209,26 +289,46 @@ export class PlayerController {
       if (phase !== this._stepPhase) {
         this._stepPhase = phase;
         const surf = this.surfaceUnder();
-        this.audio?.play('step', { gain: sprinting ? 0.62 : 0.4, pitch: (surf === 'metal' ? 1.25 : 1) * (0.94 + Math.random() * 0.12) });
-        if (Math.random() < 0.55) this.fx?.footstep(this.position, { dust: surf !== 'metal' });
-        input.onStep?.(this.position, sprinting ? 1 : 0.45);
+        const terrainSurf = this.env.surfaceAt?.(this.position.x, this.position.z) ?? 'dirt';
+        // built surfaces (metal/wood) override the terrain under them
+        const stepSurface = surf === 'metal' ? 'rock' : surf === 'wood' ? 'wood' : terrainSurf;
+        const cue = { grass: 'stepGrass', dirt: 'stepDirt', rock: 'stepRock', wood: 'stepWood' }[stepSurface] ?? 'stepDirt';
+        const pitch = (stepSurface === 'rock' ? 1.15 : stepSurface === 'wood' ? 0.88 : 1) * (0.94 + Math.random() * 0.12);
+        this.audio?.play(cue, { gain: sprinting ? 0.55 : 0.34, pitch });
+        if (Math.random() < 0.55) this.fx?.footstep(this.position, { dust: stepSurface !== 'rock' });
+        // sprinting feet are loud — the dead hear them (zombie noise system)
+        input.onStep?.(this.position, sprinting ? 1 : 0.4);
       }
     }
 
     // ---- recoil spring, shake decay
-    this.recoil.pitch = damp(this.recoil.pitch, 0, WEAPON.recoilRecovery, dt);
-    this.recoil.yaw = damp(this.recoil.yaw, 0, WEAPON.recoilRecovery * 0.85, dt);
+    this.recoil.pitch = damp(this.recoil.pitch, 0, WEAPONS.rifle.recoilRecovery, dt);
+    this.recoil.yaw = damp(this.recoil.yaw, 0, WEAPONS.rifle.recoilRecovery * 0.85, dt);
     this.recoil.roll = damp(this.recoil.roll, 0, 9, dt);
     this.shake = damp(this.shake, 0, 5.2, dt);
     this.landingDip = damp(this.landingDip, 0, 7, dt);
     this.damageCooldown = Math.max(0, this.damageCooldown - dt);
 
+    this.#poseCamera(dt, adsT, maxSpeed, sprinting);
+    this.#updateFov(dt, adsT, input);
+    return {
+      adsT,
+      sprinting,
+      moveSpeed: this.moveSpeed,
+      grounded: this.grounded,
+      pitch: this.pitch,
+    };
+  }
+
+  #poseCamera(dt, adsT, maxSpeed, sprinting) {
     // ---- camera pose
-    this.bobPhase += dt * (this.moveSpeed / Math.max(0.001, maxSpeed)) * PLAYER.bobFrequency * (sprinting ? 1.2 : 1);
+    this.bobPhase += dt * (this.moveSpeed / Math.max(0.001, maxSpeed || 1)) * PLAYER.bobFrequency * (sprinting ? 1.2 : 1);
     const bobK = clamp(this.moveSpeed / PLAYER.maxSpeed, 0, 1.6) * (1 - adsT * 0.78) * (this.grounded ? 1 : 0.2);
     const bobY = Math.sin(this.bobPhase * 2) * PLAYER.bobAmount * bobK;
     const bobX = Math.cos(this.bobPhase) * PLAYER.bobAmount * 0.55 * bobK;
-    const strafeLean = clamp((this.velocity.x * cosY + this.velocity.z * sinY) / PLAYER.maxSpeed, -1, 1);
+    const cosY = Math.cos(this.yaw);
+    const sinY = Math.sin(this.yaw);
+    const strafeLean = clamp((this.velocity.x * cosY - this.velocity.z * sinY) / PLAYER.maxSpeed, -1, 1);
     this.roll = damp(this.roll, -strafeLean * 0.022 * (1 - adsT), 6, dt);
 
     const shakeAmp = this.shake;
@@ -246,20 +346,15 @@ export class PlayerController {
       this.position.y + this.eyeHeight + bobY - this.landingDip,
       this.position.z + bobY * 0.2,
     );
+  }
 
+  #updateFov(dt, adsT, input) {
     // ---- fov: base → ADS/scope zoom, plus a sprint kick
-    const targetFov = lerp(PLAYER.baseFov, PLAYER.adsFov, clamp(adsT, 0, 1));
-    this.fovTarget = lerp(targetFov, targetFov + PLAYER.sprintFovBoost, sprinting ? 1 : 0);
+    const adsFov = input.adsFov ?? PLAYER.adsFov;
+    const targetFov = lerp(this.fovBase, adsFov, clamp(adsT, 0, 1));
+    this.fovTarget = lerp(targetFov, targetFov + PLAYER.sprintFovBoost, this._lastSprint ? 1 : 0);
     this.camera.fov = damp(this.camera.fov, this.fovTarget, 11, dt);
     this.camera.updateProjectionMatrix();
-
-    return {
-      adsT,
-      sprinting,
-      moveSpeed: this.moveSpeed,
-      grounded: this.grounded,
-      pitch: this.pitch,
-    };
   }
 
   surfaceUnder() {
@@ -278,4 +373,3 @@ export class PlayerController {
     return smoothstep(0, 1, clamp(this.moveSpeed / PLAYER.sprintSpeed, 0, 1));
   }
 }
-

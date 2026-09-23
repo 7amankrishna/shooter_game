@@ -151,6 +151,217 @@ export function createRifle({ viewmodel = false, body, grip, metal } = {}) {
   group.userData.muzzle = muzzle;
   group.userData.receiver = group.children[0];
   group.userData.handguard = hg;
+  group.userData.poses = {
+    hipPos: [0.115, -0.108, -0.26],
+    hipRot: [0.02, -0.055, 0.02],
+    adsPos: [0.0, -0.043, -0.19],
+    adsRot: [0, 0, 0],
+    sprintPos: [0.17, -0.17, -0.12],
+    sprintRot: [0.34, 0.62, 0.42],
+  };
+  return group;
+}
+
+/**
+ * P-92 sidearm: slide + frame pistol, authored from the same primitive kit.
+ * The "bolt" is the slide (cycles on every shot), the magazine drops from the
+ * grip. Sights are fixed iron — no optic dot, ADS aligns the rear notch.
+ */
+export function createSidearm({ body, grip, metal } = {}) {
+  const bodyMat = body ?? new THREE.MeshStandardMaterial({ color: 0x2b2e33, roughness: 0.5, metalness: 0.78 });
+  const gripMat = grip ?? new THREE.MeshStandardMaterial({ color: 0x33302b, roughness: 0.8, metalness: 0.08 });
+  const metalMat = metal ?? new THREE.MeshStandardMaterial({ color: 0x1a1d21, roughness: 0.42, metalness: 0.88 });
+
+  const group = new THREE.Group();
+  group.name = 'sidearm';
+  const add = (geo, mat, x = 0, y = 0, z = 0, rot = null) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    if (rot) m.rotation.set(rot[0], rot[1], rot[2]);
+    group.add(m);
+    return m;
+  };
+
+  // ---- frame + slide (slide group animates back on fire)
+  add(new THREE.BoxGeometry(0.05, 0.036, 0.2), bodyMat, 0, -0.012, -0.03); // frame
+  const slide = new THREE.Group();
+  const slideBody = new THREE.Mesh(new THREE.BoxGeometry(0.054, 0.044, 0.24), metalMat);
+  slide.add(slideBody);
+  // serrations
+  for (let i = 0; i < 4; i++) {
+    const s = new THREE.Mesh(new THREE.BoxGeometry(0.058, 0.006, 0.012), bodyMat);
+    s.position.set(0, 0, 0.06 + i * 0.018);
+    slide.add(s);
+  }
+  slide.position.set(0, 0.026, -0.03);
+  group.add(slide);
+  // ejection port
+  add(new THREE.BoxGeometry(0.02, 0.014, 0.05), new THREE.MeshBasicMaterial({ color: 0x0a0a0a }), 0.02, 0.028, -0.05);
+
+  // ---- barrel + muzzle
+  const muzzle = new THREE.Group();
+  muzzle.position.set(0, 0.026, -0.165);
+  const b = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.05, 8), metalMat);
+  b.rotation.x = Math.PI / 2;
+  muzzle.add(b);
+  group.add(muzzle);
+
+  // ---- sights (rear notch + front post — ADS aligns these)
+  add(new THREE.BoxGeometry(0.03, 0.012, 0.012), metalMat, 0, 0.054, 0.07);
+  add(new THREE.BoxGeometry(0.006, 0.014, 0.01), metalMat, 0, 0.056, -0.135);
+  const dot = new THREE.Group(); // front-aim marker, shown in ADS
+  const emitter = new THREE.Mesh(new THREE.CircleGeometry(0.0028, 8), new THREE.MeshBasicMaterial({ color: 0xffd24d }));
+  emitter.position.set(0, 0.058, -0.136);
+  dot.add(emitter);
+  dot.visible = false;
+  group.add(dot);
+
+  // ---- grip + trigger guard + mag
+  const gripMesh = new THREE.Mesh(new THREE.BoxGeometry(0.048, 0.15, 0.062), gripMat);
+  gripMesh.position.set(0, -0.095, 0.06);
+  gripMesh.rotation.x = -0.28;
+  group.add(gripMesh);
+  add(new THREE.TorusGeometry(0.028, 0.005, 6, 10, Math.PI), metalMat, 0, -0.045, 0.005, [0, 0, Math.PI]);
+  add(new THREE.BoxGeometry(0.007, 0.026, 0.007), metalMat, 0, -0.05, 0.0);
+
+  const mag = new THREE.Group();
+  const magBody = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.13, 0.05), metalMat);
+  magBody.position.set(0, -0.1, 0.06);
+  magBody.rotation.x = -0.28;
+  mag.add(magBody);
+  const floorplate = new THREE.Mesh(new THREE.BoxGeometry(0.048, 0.014, 0.06), bodyMat);
+  floorplate.position.set(0, -0.165, 0.078);
+  mag.add(floorplate);
+  group.add(mag);
+
+  // ---- hammer
+  add(new THREE.BoxGeometry(0.012, 0.024, 0.01), metalMat, 0, 0.012, 0.088, [-0.5, 0, 0]);
+
+  group.userData.mag = mag;
+  group.userData.bolt = slide;
+  group.userData.muzzle = muzzle;
+  group.userData.dot = dot;
+  group.userData.emitter = emitter;
+  group.userData.poses = {
+    hipPos: [0.13, -0.125, -0.3],
+    hipRot: [0.03, -0.07, 0.03],
+    adsPos: [0.0, -0.052, -0.34],
+    adsRot: [0, 0, 0],
+    sprintPos: [0.2, -0.24, -0.16],
+    sprintRot: [0.5, 0.7, 0.35],
+  };
+  return group;
+}
+
+/**
+ * M-700 marksman: bolt-action rifle with a heavy barrel and a scope tube.
+ * The bolt handle lifts and cycles after every shot; the "dot" is the scope
+ * reticle — only visible when the cheek weld is set (ADS).
+ */
+export function createMarksman({ body, grip, metal } = {}) {
+  const bodyMat = body ?? new THREE.MeshStandardMaterial({ color: 0x2e2f31, roughness: 0.55, metalness: 0.6 });
+  const woodMat = grip ?? new THREE.MeshStandardMaterial({ color: 0x4d3826, roughness: 0.78, metalness: 0.06 });
+  const metalMat = metal ?? new THREE.MeshStandardMaterial({ color: 0x191c20, roughness: 0.4, metalness: 0.9 });
+
+  const group = new THREE.Group();
+  group.name = 'marksman';
+  const add = (geo, mat, x = 0, y = 0, z = 0, rot = null) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    if (rot) m.rotation.set(rot[0], rot[1], rot[2]);
+    group.add(m);
+    return m;
+  };
+
+  // ---- receiver
+  add(new THREE.BoxGeometry(0.07, 0.075, 0.3), bodyMat, 0, 0, 0.0);
+  add(new THREE.BoxGeometry(0.074, 0.014, 0.28), metalMat, 0, 0.042, 0.0);
+
+  // ---- heavy barrel
+  add(new THREE.CylinderGeometry(0.017, 0.019, 0.52, 8), metalMat, 0, 0.008, -0.42, [Math.PI / 2, 0, 0]);
+  add(new THREE.CylinderGeometry(0.026, 0.026, 0.06, 10), metalMat, 0, 0.008, -0.68, [Math.PI / 2, 0, 0]);
+  const muzzle = new THREE.Group();
+  muzzle.position.set(0, 0.008, -0.72);
+  group.add(muzzle);
+
+  // ---- scope
+  const scope = new THREE.Group();
+  const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.026, 0.3, 12), metalMat);
+  tube.rotation.x = Math.PI / 2;
+  scope.add(tube);
+  const objective = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.032, 0.07, 12), metalMat);
+  objective.rotation.x = Math.PI / 2;
+  objective.position.z = -0.18;
+  scope.add(objective);
+  const ocular = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.033, 0.06, 12), metalMat);
+  ocular.rotation.x = Math.PI / 2;
+  ocular.position.z = 0.17;
+  scope.add(ocular);
+  for (const x of [-0.04, 0.04]) {
+    const ring = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.03, 8), metalMat);
+    ring.position.set(x, -0.032, 0.02);
+    scope.add(ring);
+  }
+  scope.position.set(0, 0.092, -0.03);
+  group.add(scope);
+  const dot = new THREE.Group();
+  const emitter = new THREE.Mesh(new THREE.CircleGeometry(0.004, 8), new THREE.MeshBasicMaterial({ color: 0xff3b30 }));
+  emitter.position.set(0, 0.092, 0.2);
+  dot.add(emitter);
+  // crosshair stubs
+  for (const [w, h, x, y] of [[0.012, 0.002, 0, 0.098], [0.002, 0.012, 0, 0.098]]) {
+    const ch = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: 0x111111 }));
+    ch.position.set(x, y, 0.199);
+    dot.add(ch);
+  }
+  dot.visible = false;
+  group.add(dot);
+
+  // ---- internal mag (blind box) + bolt
+  const mag = new THREE.Group();
+  const magBody = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.1), metalMat);
+  magBody.position.set(0, -0.05, -0.05);
+  mag.add(magBody);
+  group.add(mag);
+
+  const bolt = new THREE.Group();
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.07, 6), metalMat);
+  handle.rotation.z = Math.PI / 2;
+  handle.position.set(0.05, 0.02, 0.08);
+  bolt.add(handle);
+  const knob = new THREE.Mesh(new THREE.SphereGeometry(0.014, 8, 6), metalMat);
+  knob.position.set(0.085, 0.02, 0.08);
+  bolt.add(knob);
+  group.add(bolt);
+
+  // ---- wooden stock
+  const stock = new THREE.Mesh(new THREE.BoxGeometry(0.052, 0.08, 0.3), woodMat);
+  stock.position.set(0, -0.02, 0.28);
+  group.add(stock);
+  const comb = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.03, 0.14), woodMat);
+  comb.position.set(0, 0.028, 0.22);
+  group.add(comb);
+  const butt = new THREE.Mesh(new THREE.BoxGeometry(0.056, 0.11, 0.03), metalMat);
+  butt.position.set(0, -0.02, 0.43);
+  group.add(butt);
+  // fore-end furniture under the barrel
+  const fore = new THREE.Mesh(new THREE.BoxGeometry(0.058, 0.05, 0.34), woodMat);
+  fore.position.set(0, -0.035, -0.3);
+  group.add(fore);
+
+  group.userData.mag = mag;
+  group.userData.bolt = bolt;
+  group.userData.muzzle = muzzle;
+  group.userData.dot = dot;
+  group.userData.emitter = emitter;
+  group.userData.poses = {
+    hipPos: [0.115, -0.11, -0.24],
+    hipRot: [0.02, -0.05, 0.02],
+    adsPos: [0.0, -0.092, -0.13],
+    adsRot: [0, 0, 0],
+    sprintPos: [0.18, -0.2, -0.1],
+    sprintRot: [0.35, 0.66, 0.45],
+  };
   return group;
 }
 

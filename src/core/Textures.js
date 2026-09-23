@@ -220,6 +220,75 @@ function makeGround() {
   return c;
 }
 
+/** A tuft of grass blades on transparency — used by alpha-tested grass quads. */
+function makeBloodSplat() {
+  const size = 64;
+  const c = canvas(size);
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, size, size);
+  // irregular dark pool: layered blobs + speckles, alpha-falloff at the edge
+  const cx = size / 2;
+  const cy = size / 2;
+  for (let i = 0; i < 9; i++) {
+    const a = (i / 9) * Math.PI * 2;
+    const r = 10 + Math.sin(i * 2.7) * 5;
+    const bx = cx + Math.cos(a) * (5 + (i % 3) * 4);
+    const by = cy + Math.sin(a) * (5 + (i % 2) * 5);
+    const g = ctx.createRadialGradient(bx, by, 0, bx, by, r + 8);
+    g.addColorStop(0, 'rgba(46,7,8,0.95)');
+    g.addColorStop(0.55, 'rgba(38,5,6,0.55)');
+    g.addColorStop(1, 'rgba(30,4,5,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(bx, by, r + 8, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // core mass
+  const core = ctx.createRadialGradient(cx, cy, 2, cx, cy, 16);
+  core.addColorStop(0, 'rgba(52,8,9,0.98)');
+  core.addColorStop(1, 'rgba(40,6,7,0)');
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+  ctx.fill();
+  // spray speckles
+  ctx.fillStyle = 'rgba(44,6,7,0.8)';
+  for (let i = 0; i < 26; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const d = 14 + Math.random() * 16;
+    const s = 0.6 + Math.random() * 1.4;
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(a) * d, cy + Math.sin(a) * d, s, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function makeGrassBlade() {
+  const size = 64;
+  const c = canvas(size);
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, size, size);
+  const blades = 7;
+  for (let i = 0; i < blades; i++) {
+    const x0 = 8 + (i / (blades - 1)) * (size - 16) + (Math.random() - 0.5) * 4;
+    const lean = (Math.random() - 0.5) * 18;
+    const topY = 4 + Math.random() * 14;
+    const w = 2.4 + Math.random() * 1.8;
+    const g = 90 + Math.random() * 60;
+    ctx.fillStyle = `rgba(${40 + Math.random() * 30},${g},${34 + Math.random() * 20},1)`;
+    ctx.beginPath();
+    ctx.moveTo(x0 - w, size);
+    ctx.quadraticCurveTo(x0 - w * 0.4 + lean * 0.4, size * 0.45, x0 + lean, topY);
+    ctx.quadraticCurveTo(x0 + w * 0.4 + lean * 0.4, size * 0.45, x0 + w, size);
+    ctx.closePath();
+    ctx.fill();
+  }
+  return c;
+}
+
 export function getTexture(name, repeat = 1) {
   const key = `${name}#${repeat}`;
   if (cache.has(key)) return cache.get(key);
@@ -245,6 +314,12 @@ export function getTexture(name, repeat = 1) {
       break;
     case 'ground':
       tex = makeGround();
+      break;
+    case 'grassblade':
+      tex = makeGrassBlade();
+      break;
+    case 'bloodsplat':
+      tex = makeBloodSplat();
       break;
     case 'dot':
       tex = makeSoftDot();
@@ -335,6 +410,15 @@ export function makeMaterials() {
     polygonOffset: true,
     polygonOffsetFactor: -2,
     color: 0x161512,
+  });
+  M.blood = new THREE.MeshBasicMaterial({
+    map: getTexture('bloodsplat', 1),
+    transparent: true,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    color: 0xffffff,
+    opacity: 0.9,
   });
   M.flash = new THREE.SpriteMaterial({
     map: getTexture('dot'),

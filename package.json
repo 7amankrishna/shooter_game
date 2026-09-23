@@ -1,14 +1,15 @@
 {
-  "name": "blackline-arena",
+  "name": "blackline-deadfall",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "BLACKLINE // ARENA - a polished 3D 1v1 player-vs-AI tactical shooter prototype (one map, one rifle, three difficulties).",
+  "description": "BLACKLINE: DEADFALL - a survival-horror zombie shooter in an infinite procedural deadland (three.js + Vite, every asset procedural).",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
-    "test": "node --test 'tests/*.test.mjs'"
+    "test": "node --test 'tests/*.test.mjs'",
+    "smoke": "node tests/smoke.mjs"
   },
   "dependencies": {
     "three": "^0.186.0"

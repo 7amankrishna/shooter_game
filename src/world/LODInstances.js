@@ -201,6 +201,23 @@ export class CellCuller {
     return entry;
   }
 
+  /** Detaches one object (chunk streaming) and drops the cell when empty. */
+  remove(object) {
+    for (const [k, entry] of this.cells) {
+      const i = entry.objects.indexOf(object);
+      if (i < 0) continue;
+      entry.objects.splice(i, 1);
+      entry.group.remove(object);
+      if (!entry.objects.length) {
+        entry.group.removeFromParent();
+        this.cells.delete(k);
+      }
+      this.stats.total = this.cells.size;
+      return true;
+    }
+    return false;
+  }
+
   attachTo(parent) {
     for (const entry of this.cells.values()) parent.add(entry.group);
     this.stats.total = this.cells.size;

@@ -1,43 +1,27 @@
 /**
- * Heightfield — analytic terrain elevation.
+ * Heightfield — the infinite, analytic world terrain.
  *
- * `createTerrain()` returns a height function that both the terrain mesh and
- * the physics ground query use, so collision can never disagree with rendering.
- * Structures (buildings, pads, platforms) register *flattening rects* before
- * the mesh is generated, which is why props sit flush on the ground instead of
- * floating over or sinking into the hills.
+ * `heightAt`/`normalAt`/`biomeAt` are pure functions of (x, z, seed): the same
+ * input always yields the same height, on both sides of a chunk border, which
+ * is what keeps streamed terrain seamless without stitching. Structures and
+ * towers register *flattening pads* into a spatial grid so props sit flush on
+ * the ground; the pads are deterministic from the world layout, so a pad is
+ * always present before its chunk's terrain is ever sampled for rendering.
+ *
+ * Biomes (forest / field / rocky / deadland) drive amplitude, ground colour and
+ * vegetation in the chunk generator, so regions read differently as you travel.
  */
-import { fbm, smoothstep, clamp } from '../core/math.js';
+import { fbm, smoothstep, clamp, makeRng } from '../core/math.js';
 import { WORLD } from '../config/GameConfig.js';
 
-/** Road corridors in metres, arena space. Roads also flatten the terrain. */
-export const ROADS = [
-  { a: { x: -WORLD.bounds, z: -14 }, b: { x: WORLD.bounds, z: -14 }, width: 11 },
-  { a: { x: 18, z: -WORLD.bounds }, b: { x: 18, z: WORLD.bounds }, width: 11 },
-  { a: { x: -72, z: 42 }, b: { x: 64, z: 44 }, width: 8 },
-  { a: { x: -66, z: -84 }, b: { x: -60, z: 62 }, width: 6 },
-  { a: { x: 60, z: -66 }, b: { x: -34, z: 76 }, width: 5.5 },
-];
-
-export const HILLS = [
-  { x: 66, z: -62, r: 46, h: 13.5 },
-  { x: -82, z: 74, r: 40, h: 9.5 },
-  { x: 92, z: 74, r: 34, h: 7.5 },
-];
-
-const TRENCH = { a: { x: -104, z: 2 }, b: { x: -4, z: -78 }, width: 16, depth: 4.4 };
+/** A winding supply road through the world — orientation + fast travel lane. */
+export function roadCenterZ(x) {
+  return 55 * Math.sin(x * 0.006) + 22 * Math.sin(x * 0.0173 + 2.1);
+}
 
 export function roadWeight(x, z) {
-  let w = 0;
-  for (const r of ROADS) {
-    const dx = r.b.x - r.a.x;
-    const dz = r.b.z - r.a.z;
-    const len2 = dx * dx + dz * dz;
-    const t = clamp(((x - r.a.x) * dx + (z - r.a.z) * dz) / len2, 0, 1);
-    const d = Math.hypot(x - (r.a.x + dx * t), z - (r.a.z + dz * t));
-    w = Math.max(w, 1 - smoothstep(r.width * 0.5, r.width * 0.5 + 7, d));
-  }
-  return w;
+  const d = Math.abs(z - roadCenterZ(x));
+  return 1 - smoothstep(4.5, 12, d);
 }
 
 export function isRoad(x, z) {
@@ -45,14 +29,53 @@ export function isRoad(x, z) {
 }
 
 /**
- * Builds the arena height function.
- * @param {Array<{x:number,z:number,w:number,d:number,y:number,pad?:number}>} flatteners
+ * Spatial registry of terrain-flattening pads. Registering into every grid
+ * cell an expanded pad touches means a border vertex sees a neighbour chunk's
+ * pad without any cross-chunk bookkeeping.
  */
-export function createTerrain(flatteners = []) {
-  function flattenLevel(x, z) {
+export class FlattenerGrid {
+  constructor(cell = WORLD.chunkSize) {
+    this.cell = cell;
+    this.map = new Map();
+  }
+
+  #cellsFor(f) {
+    const pad = f.pad ?? 4;
+    const x0 = Math.floor((f.x - f.w / 2 - pad * 2) / this.cell);
+    const x1 = Math.floor((f.x + f.w / 2 + pad * 2) / this.cell);
+    const z0 = Math.floor((f.z - f.d / 2 - pad * 2) / this.cell);
+    const z1 = Math.floor((f.z + f.d / 2 + pad * 2) / this.cell);
+    const out = [];
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) out.push(cx * 8192 + cz);
+    }
+    return out;
+  }
+
+  add(f) {
+    for (const k of this.#cellsFor(f)) {
+      let arr = this.map.get(k);
+      if (!arr) this.map.set(k, (arr = []));
+      arr.push(f);
+    }
+    return f;
+  }
+
+  removeSet(set) {
+    for (const [k, arr] of this.map) {
+      const next = arr.filter((f) => !set.has(f));
+      if (next.length !== arr.length) this.map.set(k, next);
+    }
+  }
+
+  /** Strongest pad weight at (x, z): { level, weight } */
+  sample(x, z) {
+    const k = Math.floor(x / this.cell) * 8192 + Math.floor(z / this.cell);
+    const arr = this.map.get(k);
+    if (!arr) return EMPTY;
     let level = null;
     let weight = 0;
-    for (const f of flatteners) {
+    for (const f of arr) {
       const hw = f.w / 2 + (f.pad ?? 4);
       const hd = f.d / 2 + (f.pad ?? 4);
       const dx = Math.abs(x - f.x);
@@ -66,75 +89,169 @@ export function createTerrain(flatteners = []) {
         level = f.y;
       }
     }
-    return { level, weight };
+    return weight > 0 ? { level, weight } : EMPTY;
   }
-
-  return function terrainHeight(x, z) {
-    const r = Math.max(Math.abs(x), Math.abs(z));
-    const outside = smoothstep(52, 106, r);
-    let h = fbm(x * 0.013 + 4.2, z * 0.013 - 2.7, 4) * 3.1 + fbm(x * 0.05, z * 0.05, 2) * 0.5;
-    h *= 0.14 + 0.86 * outside;
-
-    for (const hill of HILLS) {
-      const d = Math.hypot(x - hill.x, z - hill.z);
-      h += hill.h * (1 - smoothstep(hill.r * 0.32, hill.r, d));
-    }
-
-    // dry riverbed
-    const tdx = TRENCH.b.x - TRENCH.a.x;
-    const tdz = TRENCH.b.z - TRENCH.a.z;
-    const tt = clamp(((x - TRENCH.a.x) * tdx + (z - TRENCH.a.z) * tdz) / (tdx * tdx + tdz * tdz), 0, 1);
-    const tdist = Math.hypot(x - (TRENCH.a.x + tdx * tt), z - (TRENCH.a.z + tdz * tt));
-    h -= TRENCH.depth * (1 - smoothstep(TRENCH.width * 0.4, TRENCH.width, tdist));
-
-    // road corridors get flattened towards the local base level
-    const rw = roadWeight(x, z);
-    if (rw > 0) h *= 1 - 0.94 * rw;
-
-    // structure pads
-    if (flatteners.length) {
-      const { level, weight } = flattenLevel(x, z);
-      if (weight > 0) h = h * (1 - weight) + level * weight;
-    }
-    return h;
-  };
 }
 
-/** Terrain render geometry, colour-banded by slope so the ground reads cheaply. */
-export function buildTerrainGeometry(THREE, heightFn) {
-  const size = WORLD.terrainSize;
-  const seg = WORLD.terrainSegments;
-  const geo = new THREE.PlaneGeometry(size, size, seg, seg);
+const EMPTY = { level: null, weight: 0 };
+
+export class WorldTerrain {
+  constructor({ seed = WORLD.seed } = {}) {
+    this.seed = seed;
+    const rng = makeRng(seed ^ 0x5f3759df);
+    // per-seed character: amplitude, roughness, ridge strength
+    this.amp = 4.4 + rng() * 2.2;
+    this.rough = 0.9 + rng() * 0.5;
+    this.ridgeAmp = 7.5 + rng() * 5;
+    this.o1 = rng() * 40;
+    this.o2 = rng() * 40;
+    this.flats = new FlattenerGrid();
+    // the spawn camp sits on level ground whatever the seed rolls
+    this.spawnLevel = this.#raw(0, 0);
+  }
+
+  /** Biome weights at (x, z): forest, rocky, dead, field (field = remainder). */
+  biomeAt(x, z) {
+    // three independent channels so every blend (and pure open field) exists
+    const nf = fbm(x * 0.0015 + this.o1, z * 0.0015 - this.o1, 2);
+    const nr = fbm(x * 0.0019 - this.o2, z * 0.0019 + this.o2, 2);
+    const nd = fbm(x * 0.0013 + this.o2, z * 0.0013 - this.o2, 2);
+    const forest = clamp((nf - 0.02) / 0.26, 0, 1);
+    const rocky = clamp((nr - 0.08) / 0.2, 0, 1);
+    const dead = clamp((nd - 0.1) / 0.2, 0, 1);
+    const field = 0.34; // baseline — open ground wherever the others fade out
+    const total = forest + rocky + dead + field;
+    return {
+      forest: forest / total,
+      rocky: rocky / total,
+      dead: dead / total,
+      field: field / total,
+    };
+  }
+
+  #raw(x, z) {
+    const base = fbm(x * 0.0085 + this.o2, z * 0.0085 - this.o1, 4) * this.amp;
+    const hills = fbm(x * 0.028 - this.o1, z * 0.028 + this.o2, 3) * 3.4;
+    const detail = fbm(x * 0.055, z * 0.055, 2) * 0.5 * this.rough;
+    const b = this.biomeAt(x, z);
+    let h = base + hills + detail;
+    // rocky ridges: inverted-noise ridges, only where the biome wants them
+    const r = 1 - Math.abs(fbm(x * 0.022 - this.o1, z * 0.022 + this.o2, 3));
+    h += r * r * (this.ridgeAmp + 6) * b.rocky;
+    // deadland: flatter, sunken, eerie
+    h = h * (1 - 0.35 * b.dead) - 0.6 * b.dead;
+    return h;
+  }
+
+  heightAt(x, z) {
+    let h = this.#raw(x, z);
+    // supply road: damped corridor so it stays traversable but not flat
+    const rw = roadWeight(x, z);
+    if (rw > 0) h *= 1 - 0.86 * rw;
+    // spawn clearing
+    const cw = 1 - smoothstep(WORLD.spawnClearing * 0.72, WORLD.spawnClearing * 1.3, Math.hypot(x, z));
+    if (cw > 0) h = h * (1 - cw) + this.spawnLevel * cw;
+    // structure pads (deterministic, registered by the chunk layout)
+    const f = this.flats.sample(x, z);
+    if (f.weight > 0) h = h * (1 - f.weight) + f.level * f.weight;
+    return h;
+  }
+
+  normalAt(x, z, out = { x: 0, y: 1, z: 0 }) {
+    const e = 1.1;
+    const nx = this.heightAt(x - e, z) - this.heightAt(x + e, z);
+    const nz = this.heightAt(x, z - e) - this.heightAt(x, z + e);
+    const len = Math.hypot(nx, 2 * e, nz) || 1;
+    out.x = nx / len;
+    out.y = (2 * e) / len;
+    out.z = nz / len;
+    return out;
+  }
+
+  /** Ground steepness 0..1 at a point (1 = 45°+). */
+  slopeAt(x, z) {
+    const n = this.normalAt(x, z, _n);
+    return 1 - n.y;
+  }
+}
+
+const _n = { x: 0, y: 1, z: 0 };
+
+/**
+ * Terrain mesh for one chunk.
+ *
+ * A height grid with a one-cell border is sampled once; heights, normals and
+ * colours all derive from that grid. Because border samples come from the same
+ * analytic function the neighbour chunk uses, normals match exactly across
+ * chunk seams — no stitching, no visible transitions.
+ */
+export function buildChunkGeometry(THREE, terrain, cx, cz, size, segments) {
+  const geo = new THREE.PlaneGeometry(size, size, segments, segments);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
+  const ox = cx * size + size / 2;
+  const oz = cz * size + size / 2;
+  const step = size / segments;
+  // (segments+3)² grid: one extra cell of border on every side
+  const N = segments + 3;
+  const heights = new Float32Array(N * N);
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const x = ox - size / 2 + (i - 1) * step;
+      const z = oz - size / 2 + (j - 1) * step;
+      heights[j * N + i] = terrain.heightAt(x, z);
+    }
+  }
   const colors = new Float32Array(pos.count * 3);
-  const uvArr = new Float32Array(pos.count * 2);
-  const cGrass = [0.31, 0.34, 0.23];
-  const cDirt = [0.41, 0.35, 0.25];
-  const cRock = [0.4, 0.4, 0.38];
-  const cSand = [0.52, 0.48, 0.37];
+  const normals = new Float32Array(pos.count * 3);
+  const cGrass = [0.3, 0.35, 0.22];
+  const cGrassDry = [0.42, 0.39, 0.24];
+  const cRock = [0.42, 0.41, 0.38];
+  const cDead = [0.34, 0.31, 0.25];
+  const cRoad = [0.36, 0.35, 0.33];
+  // PlaneGeometry vertex order: row-major from -x,-z
   for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i);
-    const z = pos.getZ(i);
-    const h = heightFn(x, z);
-    pos.setY(i, h);
-    const slope =
-      Math.abs(heightFn(x + 2, z) - heightFn(x - 2, z)) + Math.abs(heightFn(x, z + 2) - heightFn(x, z - 2));
-    const t = clamp(slope * 0.3, 0, 1);
-    const n = (fbm(x * 0.11, z * 0.11, 2) + 1) * 0.5;
+    const vx = pos.getX(i);
+    const vz = pos.getZ(i);
+    const gx = Math.round((vx + size / 2) / step + 1);
+    const gz = Math.round((vz + size / 2) / step + 1);
+    const h = heights[gz * N + gx];
+    pos.setY(i, Number.isFinite(h) ? h : terrain.heightAt(vx + ox, vz + oz));
+    const hl = heights[gz * N + gx - 1];
+    const hr = heights[gz * N + gx + 1];
+    const hd = heights[(gz - 1) * N + gx];
+    const hu = heights[(gz + 1) * N + gx];
+    const nx = (hl - hr) / (2 * step);
+    const nz2 = (hd - hu) / (2 * step);
+    const len = Math.hypot(nx, 1, nz2) || 1;
+    normals[i * 3] = nx / len;
+    normals[i * 3 + 1] = 1 / len;
+    normals[i * 3 + 2] = nz2 / len;
+    const slope = 1 - 1 / len;
+    const x = vx + ox;
+    const z = vz + oz;
+    const b = terrain.biomeAt(x, z);
     let col;
-    if (h < -1.6) col = cSand;
-    else if (isRoad(x, z)) col = cDirt;
-    else col = t > 0.42 ? cRock : n > 0.56 ? cDirt : cGrass;
-    const shade = 0.84 + n * 0.3 - t * 0.08;
+    if (isRoad(x, z)) col = cRoad;
+    else if (slope > 0.34 || b.rocky > 0.55) col = cRock;
+    else if (b.dead > 0.45) col = cDead;
+    else {
+      const t = b.forest;
+      col = [
+        cGrass[0] * (1 - t * 0.5),
+        cGrass[1] * (1 - t * 0.4) + t * 0.04,
+        cGrass[2] * (1 - t * 0.3),
+      ];
+      void cGrassDry;
+    }
+    const n2 = (fbm(x * 0.11, z * 0.11, 2) + 1) * 0.5;
+    const shade = 0.82 + n2 * 0.3 - slope * 0.08;
     colors[i * 3] = col[0] * shade;
     colors[i * 3 + 1] = col[1] * shade;
     colors[i * 3 + 2] = col[2] * shade;
-    uvArr[i * 2] = x / 8;
-    uvArr[i * 2 + 1] = z / 8;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geo.setAttribute('uv', new THREE.BufferAttribute(uvArr, 2));
-  geo.computeVertexNormals();
+  geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geo.translate(ox, 0, oz);
   return geo;
 }

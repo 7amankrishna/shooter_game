@@ -398,10 +398,11 @@ export class Fx {
     this.fluid = new ParticleField({ capacity: 320, blending: THREE.NormalBlending, gravity: -20, drag: 0.6, map: 'dot', baseSize: 0.1 });
     this.tracers = new TracerField(FX.maxTracers);
     this.decals = new DecalPool(FX.maxDecals, materials.decal);
+    this.bloodPool = new DecalPool(FX.maxBloodDecals, materials.blood, 0.55);
     this.shells = new ShellPool(FX.maxShells, materials.brass ?? new THREE.MeshLambertMaterial({ color: 0xb08d4a }));
     this.group = new THREE.Group();
     this.group.name = 'fx';
-    this.group.add(this.sparks.points, this.smoke.points, this.fluid.points, this.tracers.lines, this.decals.mesh, this.shells.mesh);
+    this.group.add(this.sparks.points, this.smoke.points, this.fluid.points, this.tracers.lines, this.decals.mesh, this.bloodPool.mesh, this.shells.mesh);
     this.world = null;
   }
 
@@ -428,6 +429,7 @@ export class Fx {
     this.fluid.clear();
     this.tracers.clear();
     this.decals.clear();
+    this.bloodPool.clear();
     this.shells.clear();
   }
 
@@ -478,6 +480,64 @@ export class Fx {
       });
     }
     this.decals.spawn(point, normal, Math.random);
+  }
+
+  /**
+   * Bullet wound: dark arterial spray along the shot direction, a mist puff,
+   * and the occasional wall/ground spatter behind the target.
+   */
+  bloodSpray(point, dir = null, { heavy = false } = {}) {
+    const n = heavy ? 16 : 9;
+    const bx = dir ? dir.x : 0;
+    const by = dir ? dir.y : 0;
+    const bz = dir ? dir.z : 0;
+    for (let i = 0; i < n; i++) {
+      const s = 1.6 + Math.random() * (heavy ? 5.2 : 3.4);
+      this.fluid.spawn({
+        x: point.x, y: point.y, z: point.z,
+        vx: bx * s + (Math.random() - 0.5) * 2.4,
+        vy: by * s * 0.4 + 0.4 + Math.random() * 1.8,
+        vz: bz * s + (Math.random() - 0.5) * 2.4,
+        life: 0.22 + Math.random() * 0.3, size: 0.05 + Math.random() * 0.08,
+        color: [0.42, 0.05, 0.06], alpha: 0.85, bounce: 0.15,
+      });
+    }
+    // fine mist hangs in the air a moment
+    for (let i = 0; i < 3; i++) {
+      this.smoke.spawn({
+        x: point.x, y: point.y, z: point.z,
+        vx: bx * 0.8 + (Math.random() - 0.5) * 0.6, vy: 0.3 + Math.random() * 0.4, vz: bz * 0.8 + (Math.random() - 0.5) * 0.6,
+        life: 0.3 + Math.random() * 0.25, size: 0.1 + Math.random() * 0.08,
+        color: [0.3, 0.05, 0.05], alpha: 0.5,
+      });
+    }
+    if (Math.random() < (heavy ? 0.7 : 0.3)) {
+      // spatter mark near the wound
+      this.bloodPool.spawn(
+        { x: point.x + bx * 0.4, y: point.y - 0.6, z: point.z + bz * 0.4 },
+        { x: 0, y: 1, z: 0 },
+        Math.random,
+      );
+    }
+  }
+
+  /** Death burst: the body gives out. */
+  bloodBurst(point, count = 12) {
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = 0.8 + Math.random() * 3.4;
+      this.fluid.spawn({
+        x: point.x, y: point.y, z: point.z,
+        vx: Math.cos(a) * sp, vy: 0.5 + Math.random() * 2.2, vz: Math.sin(a) * sp,
+        life: 0.3 + Math.random() * 0.4, size: 0.06 + Math.random() * 0.1,
+        color: [0.4, 0.05, 0.06], alpha: 0.85, bounce: 0.2,
+      });
+    }
+  }
+
+  /** Lingering pool under a body. */
+  bloodDecal(x, z, y) {
+    this.bloodPool.spawn({ x, y: y + 0.03, z }, { x: 0, y: 1, z: 0 }, Math.random);
   }
 
   /** Restrained hit feedback for the machine: coolant mist + sparks, no gore. */

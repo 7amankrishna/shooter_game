@@ -1,206 +1,364 @@
 /**
- * Unit tests for the pure gameplay logic (no renderer, no DOM).
- * Run with: npm test
+ * Logic tests: math, config invariants, physics, terrain, world layout,
+ * zombies, economy, day/night and weather — everything that doesn't need the
+ * full Survival loop (sim.test.mjs covers that).
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
+import { installDomStub } from './stubDom.js';
 
-import { Scoring } from '../src/game/Scoring.js';
-import { ColliderWorld } from '../src/physics/ColliderWorld.js';
-import { NavGrid } from '../src/world/NavGrid.js';
-import { createTerrain, buildTerrainGeometry } from '../src/physics/Heightfield.js';
-import { BODY, SCORING as SCORE_CFG } from '../src/config/GameConfig.js';
-import { DIFFICULTIES, DIFFICULTY_ORDER } from '../src/config/DifficultyConfig.js';
-import { angleDelta, clamp } from '../src/core/math.js';
+installDomStub();
 
-void THREE;
+const { makeMaterials } = await import('../src/core/Textures.js');
+const {
+  WORLD, PLAYER, WEAPONS, WEAPON_ORDER, ZOMBIE_TYPES, ZOMBIES, ECONOMY, TOWERS, DAYNIGHT, WEATHER,
+} = await import('../src/config/GameConfig.js');
+const { World, chunkLayout, towerForCell } = await import('../src/world/World.js');
+const { WorldTerrain, buildChunkGeometry } = await import('../src/physics/Heightfield.js');
+const { ColliderWorld } = await import('../src/physics/ColliderWorld.js');
+const { makeRng, valueNoise, fbm, angleDelta, clamp, coordsRng } = await import('../src/core/math.js');
+const { Zombie } = await import('../src/zombies/Zombie.js');
+const { ZombieManager } = await import('../src/zombies/ZombieManager.js');
+const { DayNight } = await import('../src/game/DayNight.js');
+const { Weather } = await import('../src/game/Weather.js');
+const { Economy } = await import('../src/game/Economy.js');
+const { Loadout } = await import('../src/weapons/Loadout.js');
+const { RainField } = await import('../src/core/RainField.js');
 
-test('scoring: headshots outrank body hits and combo tiers apply', () => {
-  const s = new Scoring();
-  s.registerShot();
-  const chest = s.registerHit('chest', BODY.chest.points);
-  assert.equal(chest.points, 50, 'first hit has no multiplier');
-  for (let i = 0; i < 3; i++) {
-    s.registerShot();
-    s.registerHit('chest', BODY.chest.points);
+const DT = 1 / 60;
+
+/* ----------------------------------------------------------------- math */
+
+test('math: integer hash noise is deterministic, bounded and seed-stable', () => {
+  assert.equal(valueNoise(3.5, -2.25), valueNoise(3.5, -2.25), 'same input, same output');
+  for (let i = 0; i < 500; i++) {
+    const v = valueNoise(i * 0.37, i * -1.11);
+    assert.ok(v >= -1.001 && v <= 1.001, `noise in bounds: ${v}`);
+    assert.ok(Number.isFinite(fbm(i * 0.13, i * 0.29, 4)), 'fbm finite');
   }
-  assert.ok(s.multiplier >= 1.5, 'streak of 4 should raise the multiplier');
-  s.registerShot();
-  const head = s.registerHit('head', BODY.head.points);
-  assert.ok(head.points > 100, 'headshot during a combo must beat a bare headshot');
-  assert.equal(s.headshots, 1);
+  const r1 = makeRng(1337);
+  const r2 = makeRng(1337);
+  for (let i = 0; i < 8; i++) assert.equal(r1(), r2(), 'seeded rng streams match');
+  const c1 = coordsRng(99, 4, -6);
+  const c2 = coordsRng(99, 4, -6);
+  assert.equal(c1(), c2(), 'per-chunk rng is deterministic');
 });
 
-test('scoring: a miss keeps the combo only inside the grace window', () => {
-  const s = new Scoring();
-  s.registerHit('chest', 50);
-  s.registerHit('chest', 50);
-  assert.equal(s.streak, 2);
-  s.registerMiss();
-  s.update(SCORE_CFG.comboGrace * 0.5);
-  assert.equal(s.streak, 2, 'still alive inside the grace window');
-  s.registerHit('leg', 20);
-  assert.equal(s.streak, 3, 'the hit inside the window extends the streak');
-  s.registerMiss();
-  s.update(SCORE_CFG.comboGrace + 0.1);
-  assert.equal(s.streak, 0, 'expired grace resets the combo');
-  assert.equal(s.multiplier, 1);
+test('math: angleDelta wraps to the shortest signed path', () => {
+  assert.ok(Math.abs(angleDelta(Math.PI * 1.9, -Math.PI * 1.9)) < 0.7);
+  assert.ok(angleDelta(0.5, 0.1) > 0);
+  assert.ok(angleDelta(0.1, 0.5) < 0);
+  assert.equal(angleDelta(1, 1), 0);
 });
 
-test('scoring: accuracy bonus is monotonic and requires volume', () => {
-  const s = new Scoring();
-  for (let i = 0; i < 4; i++) {
-    s.registerShot();
-    s.registerHit('chest', 50);
+/* --------------------------------------------------------------- config */
+
+test('config: three weapons with model, sound and balancing keys', () => {
+  assert.deepEqual(WEAPON_ORDER, ['sidearm', 'rifle', 'marksman']);
+  for (const key of WEAPON_ORDER) {
+    const w = WEAPONS[key];
+    assert.ok(w.model, `${key} has a viewmodel`);
+    assert.ok(w.sound, `${key} has a sound cue`);
+    assert.ok(w.magSize > 0 && w.rpm > 0 && w.damage > 0, `${key} core stats`);
+    assert.ok(w.reserveStart <= w.reserveMax, `${key} reserve bounds`);
+    assert.ok(w.hipSpread > w.adsSpread, `${key} ADS tightens spread`);
   }
-  assert.equal(s.accuracyBonusAwarded, 0, 'below the minimum shot count');
-  for (let i = 0; i < 10; i++) {
-    s.registerShot();
-    s.registerHit('chest', 50);
+  assert.ok(WEAPONS.marksman.adsFov < 20, 'marksman is scoped');
+});
+
+test('config: five zombie types with complete stat blocks', () => {
+  const need = ['id', 'label', 'health', 'speed', 'sprintSpeed', 'damage', 'attackRange', 'attackWindup',
+    'attackCooldown', 'viewRange', 'fovDeg', 'acquireTime', 'hearing', 'aggression', 'poise',
+    'coins', 'weight', 'colors', 'scale'];
+  for (const [key, z] of Object.entries(ZOMBIE_TYPES)) {
+    for (const k of need) assert.ok(z[k] !== undefined, `${key}.${k}`);
+    assert.ok(Array.isArray(z.coins) && z.coins[0] <= z.coins[1], `${key} coin range`);
+    assert.ok(z.weight.base > 0 && z.weight.night > 0, `${key} weights positive`);
   }
-  assert.ok(s.accuracyBonusAwarded >= 1, 'perfect accuracy past the threshold pays out');
-  const before = s.score;
-  s.registerHit('chest', 50);
-  assert.ok(s.score > before);
-});
-
-test('scoring: kill payout + summary shape for the results screen', () => {
-  const s = new Scoring();
-  s.registerShot();
-  s.registerHit('head', 100);
-  const kill = s.applyKill({ headshotKill: true, elapsedSeconds: 60 });
-  assert.ok(kill.points >= SCORE_CFG.killBonus + SCORE_CFG.headshotKillBonus);
-  const sum = s.summary(60, 'WIN');
-  for (const k of ['score', 'hits', 'misses', 'accuracy', 'headshots', 'elapsed']) assert.ok(k in sum, k);
-  assert.equal(sum.outcome, 'WIN');
-});
-
-test('colliders: ray hits, misses and respects tag skipping', () => {
-  const world = new ColliderWorld({ halfSize: 50, terrain: () => 0 });
-  world.addBox(0, 1, -10, 4, 2, 0.5, 'structure');
-  world.addBox(0, 1, -5, 2, 2, 0.2, 'fence');
-  const origin = { x: 0, y: 1, z: 0 };
-  const hit = world.raycast(origin, { x: 0, y: 0, z: -1 }, 40);
-  assert.ok(hit, 'first blocker is the fence');
-  assert.ok(Math.abs(hit.dist - 4.9) < 0.01, `fence distance ${hit.dist}`);
-  const wall = world.raycast(origin, { x: 0, y: 0, z: -1 }, 40, { skipTags: ['fence'] });
-  assert.ok(wall, 'skipping the fence exposes the wall');
-  assert.ok(Math.abs(wall.dist - 9.75) < 0.01, `wall distance ${wall.dist}`);
-  assert.equal(wall.surface, 'concrete');
-  const through = world.raycast(origin, { x: 0, y: 0, z: -1 }, 40, { skipTags: ['fence', 'structure'] });
-  assert.equal(through, null, 'skipping both tags lets bullets pass');
-  assert.ok(Math.abs(wall.normal.z - 1) < 1e-6, 'impact normal faces the shooter');
-  const miss = world.raycast(origin, { x: 1, y: 0, z: 0 }, 40);
-  assert.equal(miss, null);
-  assert.ok(world.hasLineOfSight({ x: 0, y: 4.5, z: 0 }, { x: 0, y: 4.5, z: -30 }), 'over the wall is clear');
-  assert.equal(world.hasLineOfSight({ x: 0, y: 1, z: -2 }, { x: 0, y: 1, z: -20 }), false, 'wall blocks sight');
-});
-
-test('colliders: terrain blocks both shots and sight lines', () => {
-  const world = new ColliderWorld({ halfSize: 60, terrain: (x, z) => (Math.abs(x) < 6 && z < -10 ? 4 : 0) });
-  const shot = world.raycastWithTerrain({ x: 0, y: 1.6, z: 0 }, { x: 0, y: 0, z: -1 }, 60);
-  assert.ok(shot, 'ridge should stop a flat shot');
-  assert.equal(shot.box, null, 'and it should register as a terrain hit');
-  assert.ok(shot.dist > 9 && shot.dist < 12, `terrain hit distance ${shot.dist}`);
-});
-
-test('colliders: body sweep lands on box tops, steps up ledges and slides on walls', () => {
-  const opts = { radius: 0.4, height: 1.8, stepHeight: 0.62 };
-  const world = new ColliderWorld({ halfSize: 40, terrain: () => 0 });
-  world.addBox(0, 0.25, -3, 3, 0.5, 3, 'crate');
-  const pos = { x: 0, y: 0, z: 0 };
-  world.moveBody(pos, { x: 0, y: 0, z: -4 }, 0.25, opts);
-  world.moveBody(pos, { x: 0, y: 0, z: -4 }, 0.25, opts);
-  assert.ok(pos.y >= 0.49 && pos.y <= 0.51, `stepped up onto the crate (y=${pos.y})`);
-
-  world.addBox(0, 1.5, -9, 3, 3, 1, 'wall');
-  // the caller owns gravity (as PlayerController does), so feed it here
-  let vy = 0;
-  for (let i = 0; i < 60; i++) {
-    vy -= 24 * 0.05;
-    const r = world.moveBody(pos, { x: 0, y: vy, z: -4 }, 0.05, opts);
-    if (r.grounded) { vy = 0; }
+  assert.equal(Object.keys(ZOMBIE_TYPES).length, 5);
+  const nightHeavier = Object.values(ZOMBIE_TYPES).filter((z) => z.weight.night > z.weight.base);
+  assert.ok(nightHeavier.length >= 1, 'some types thicken at night');
+  for (const k of ['spawnNear', 'spawnFar', 'despawn', 'towerExclusion', 'noiseGunshot']) {
+    assert.ok(ZOMBIES[k] > 0, `ZOMBIES.${k}`);
   }
-  // wall face is z=-8.5, body radius 0.4 → it must stop ~one radius short
-  assert.ok(pos.z <= -7.85 && pos.z >= -8.15, `stopped one radius off the wall (z=${pos.z})`);
-  assert.ok(Math.abs(pos.y) < 0.05, `walked off the crate back to the ground (y=${pos.y})`);
-
-  // pressing diagonally into a long wall must keep the lateral component (slide)
-  world.addBox(0, 1.5, -20, 60, 3, 1, 'structure');
-  const slide = { x: 0, y: 0, z: -18.4 };
-  let sy = 0;
-  for (let i = 0; i < 40; i++) {
-    sy -= 24 * 0.05;
-    if (world.moveBody(slide, { x: 3.5, y: sy, z: -2 }, 0.05, opts).grounded) sy = 0;
-  }
-  assert.ok(slide.x > 5, `wall sliding kept lateral motion (x=${slide.x})`);
-  assert.ok(slide.z > -19.2 && slide.z < -18.9, `and never passed through (z=${slide.z})`);
-
-  // a ledge taller than stepHeight is a wall, not a stair
-  const ledge = new ColliderWorld({ halfSize: 40, terrain: () => 0 });
-  ledge.addBox(0, 1, -3, 6, 2, 4, 'crate');
-  const p2 = { x: 0, y: 0, z: 0 };
-  let gy = 0;
-  for (let i = 0; i < 40; i++) {
-    gy -= 24 * 0.05;
-    if (ledge.moveBody(p2, { x: 0, y: gy, z: -4 }, 0.05, opts).grounded) gy = 0;
-  }
-  assert.equal(p2.y, 0, 'no teleporting up a 2 m box');
-  assert.ok(p2.z > -0.75 && p2.z < -0.5, `blocked at the leading edge (z=${p2.z})`);
+  assert.ok(ZOMBIES.spawnNear > ZOMBIES.towerExclusion, 'spawn annulus starts outside tower zones');
 });
 
-test('navmesh: paths around a blocking structure and marks it non-walkable', () => {
-  const world = new ColliderWorld({ halfSize: 30, terrain: () => 0 });
-  world.addBox(0, 1, 0, 24, 2, 3, 'structure'); // a wall across the middle
-  const nav = new NavGrid({ world, halfSize: 28, cell: 1, agentRadius: 0.5, agentHeight: 1.8 }).bake();
-  const st = nav.stats();
-  assert.ok(st.walkable > st.cells * 0.7, `${st.walkable}/${st.cells} cells walkable`);
-  assert.ok(st.walkable < st.cells - 40, 'the wall removed cells');
-  const from = nav.toCell(-10, -8);
-  const to = nav.toCell(-10, 8);
-  assert.ok(nav.walkable(from) && nav.walkable(to));
-  const path = nav.findPath(from, to);
-  assert.ok(path && path.length > 3, 'must find a way around the wall');
-  for (const p of path) {
-    const cell = nav.toCell(p.x, p.z);
-    assert.equal(nav.blocked[cell], 0, 'path stays on walkable cells');
+test('config: crate loot tables roll valid items with sane chances', () => {
+  for (const crate of Object.values(ECONOMY.crates)) {
+    assert.ok(crate.cost > 0, `${crate.id} costs something`);
+    assert.ok(crate.rolls.length >= 2, `${crate.id} has variety`);
+    for (const r of crate.rolls) {
+      assert.ok(r.chance > 0 && r.chance <= 1, `${crate.id}.${r.item} chance`);
+      assert.ok(r.amount[0] <= r.amount[1], `${crate.id}.${r.item} amount range`);
+    }
+  }
+  assert.ok(ECONOMY.crates.basic.cost < ECONOMY.crates.premium.cost, 'premium costs more');
+});
+
+/* ---------------------------------------------------------------- world */
+
+test('terrain: heights are pure, bounded and pads actually flatten', () => {
+  const t = new WorldTerrain({ seed: 20260917 });
+  for (const [x, z] of [[0, 0], [120, -80], [-333, 512], [77, 77]]) {
+    assert.equal(t.heightAt(x, z), t.heightAt(x, z), 'pure');
+    assert.ok(Number.isFinite(t.heightAt(x, z)), 'finite');
+    const b = t.biomeAt(x, z);
+    for (const k of ['forest', 'field', 'rocky', 'dead']) {
+      assert.ok(b[k] >= 0 && b[k] <= 1, `biome channel ${k} in [0,1]`);
+    }
+  }
+  // the spawn clearing is actually flat
+  const h0 = t.heightAt(0, 0);
+  for (let r = 1; r <= 6; r += 1) {
+    assert.ok(Math.abs(t.heightAt(r, 0) - h0) < 0.35, `clearing flat at r=${r}`);
   }
 });
 
-test('terrain: height function is pure, bounded and flattens building pads', () => {
-  const h1 = createTerrain([]);
-  const h2 = createTerrain([]);
-  for (const [x, z] of [[0, 0], [-41.3, 12.7], [88, -77], [-5, -95]]) {
-    assert.equal(h1(x, z), h2(x, z), 'deterministic');
-    assert.ok(Number.isFinite(h1(x, z)));
-    assert.ok(Math.abs(h1(x, z)) < 40);
+test('terrain: chunk geometry has no NaN heights, normals or colours', () => {
+  const t = new WorldTerrain({ seed: 20260917 });
+  for (const [cx, cz] of [[0, 0], [2, -3], [-4, 1]]) {
+    const geo = buildChunkGeometry(THREE, t, cx, cz, WORLD.chunkSize, WORLD.chunkSegments);
+    for (const attr of ['position', 'normal', 'color']) {
+      const a = geo.attributes[attr].array;
+      for (let i = 0; i < a.length; i++) {
+        assert.ok(Number.isFinite(a[i]), `${attr}[${i}] finite at chunk ${cx},${cz}`);
+      }
+    }
+    geo.dispose();
   }
-  const withPad = createTerrain([{ x: 20, z: 20, w: 20, d: 20, y: 1.5, pad: 2 }]);
-  assert.ok(Math.abs(withPad(20, 20) - 1.5) < 0.02, 'pad centre sits exactly at the level');
-  const geo = buildTerrainGeometry(THREE, withPad);
-  assert.ok(geo.attributes.position.count > 1000);
-  assert.ok(geo.attributes.color.count === geo.attributes.position.count);
-  geo.dispose();
 });
 
-test('difficulty presets: three tiers, monotonic skill, none of them an aimbot', () => {
-  assert.deepEqual(DIFFICULTY_ORDER, ['EASY', 'MEDIUM', 'HARD']);
-  const [e, m, h] = DIFFICULTY_ORDER.map((k) => DIFFICULTIES[k]);
-  assert.ok(e.reaction[0] > m.reaction[0] && m.reaction[0] > h.reaction[0], 'reaction time improves');
-  assert.ok(e.aimErrorDeg > m.aimErrorDeg && m.aimErrorDeg > h.aimErrorDeg, 'grouping tightens');
-  assert.ok(h.coverChance > m.coverChance && m.coverChance > e.coverChance, 'cover use scales');
-  assert.ok(h.flankChance > e.flankChance, 'flanking scales');
-  // the HARD fairness contract from the design brief
-  assert.ok(h.reaction[1] >= 0.2, 'still has a reaction delay');
-  assert.ok(h.aimErrorDeg > 0.4, 'still misses');
-  assert.ok(h.intentionalMiss > 0, 'still throws shots');
-  assert.ok(h.magSize > 0 && h.reloadTime > 1.5, 'limited ammo + reload time');
-  assert.ok(h.moveSpeed < 6.5, 'human-like movement speed');
+test('colliders: ray hits boxes, skips tags, terrain blocks, owners clean up', () => {
+  const col = new ColliderWorld({ terrain: () => 0 });
+  col.addBox(0, 1, -5, 2, 2, 2, 'crate', { owner: 'test:1' });
+  col.addBox(0, 1, -6, 2, 2, 2, 'fence', { owner: 'test:2' });
+  const hit = col.raycast({ x: 0, y: 1, z: 0 }, { x: 0, y: 0, z: -1 }, 50, {});
+  assert.ok(hit && hit.dist > 3 && hit.dist < 5, 'box hit at expected range');
+  const skipped = col.raycast({ x: 0, y: 1, z: 0 }, { x: 0, y: 0, z: -1 }, 50, { skipTags: ['fence'] });
+  assert.equal(skipped.box.tag, 'crate', 'fence skipped, crate hit');
+  col.removeByOwner('test:1');
+  col.removeByOwner('test:2');
+  const gone = col.raycast({ x: 0, y: 1, z: 0 }, { x: 0, y: 0, z: -1 }, 50, {});
+  assert.equal(gone, null, 'owner removal cleans the grid');
 });
 
-test('math helpers: angle wrapping and clamps', () => {
-  assert.ok(Math.abs(angleDelta(0.1, Math.PI * 2 + 0.1)) < 1e-9);
-  assert.equal(clamp(5, 0, 3), 3);
-  assert.equal(clamp(-5, 0, 3), 0);
+test('colliders: moveBody lands on tops, steps ledges, never launches', () => {
+  const col = new ColliderWorld({ terrain: (x, z) => Math.sin(x * 0.05) * 2 });
+  // a steppable crate (top at 0.5, under the 0.62 step height) and, behind
+  // it, an unclimbable wall
+  col.addBox(0, 0.25, -10, 4, 0.5, 4, 'crate', { owner: 't:1' });
+  col.addBox(0, 3, -16, 6, 6, 1, 'wall', { owner: 't:2' });
+  const pos = new THREE.Vector3(0, 5, 0);
+  const vel = new THREE.Vector3(0, 0, 0);
+  let grounded = false;
+  let hitWall = false;
+  let onCrate = false;
+  for (let i = 0; i < 300; i++) {
+    vel.y += WORLD.gravity * DT;
+    vel.z = -4; // walk onto the crate, across it, then into the wall
+    const r = col.moveBody(pos, vel, DT, { radius: 0.4, height: 1.8, stepHeight: 0.62, grounded, snapDown: PLAYER.snapDown, climbRate: PLAYER.slopeClimbRate });
+    grounded = r.grounded;
+    if (r.grounded) vel.y = 0;
+    if (r.hitWall) hitWall = true;
+    if (r.grounded && pos.z > -12.2 && pos.z < -7.8 && Math.abs(pos.y - 0.5) < 0.15) onCrate = true;
+    assert.ok(Number.isFinite(pos.x + pos.y + pos.z), `frame ${i}: position finite`);
+    assert.ok(pos.y < 12, `frame ${i}: no launch (y=${pos.y})`);
+  }
+  assert.ok(grounded, 'settled');
+  assert.ok(onCrate, 'walked up and over the low crate (step-up, not a teleport)');
+  assert.ok(hitWall, 'the tall wall actually blocked the walk');
+  assert.ok(pos.z > -15.4, `wall stopped the body at z=${pos.z.toFixed(2)} (wall face at -15.5)`);
+});
+
+test('world: chunk layout and towers are deterministic and towers avoid roads', () => {
+  for (const [cx, cz] of [[0, 0], [3, -7], [-12, 5]]) {
+    const a = chunkLayout(20260917, cx, cz);
+    const b = chunkLayout(20260917, cx, cz);
+    assert.deepEqual(a, b, `layout ${cx},${cz} deterministic`);
+    assert.deepEqual(chunkLayout(999, cx, cz), chunkLayout(999, cx, cz), 'other seed deterministic');
+  }
+  // several tower cells produce towers; none sits on the road
+  let found = 0;
+  for (let tx = -3; tx <= 3; tx++) {
+    for (let tz = -3; tz <= 3; tz++) {
+      const t = towerForCell(20260917, tx, tz);
+      if (!t) continue;
+      found++;
+      const roadZ = 55 * Math.sin(0.006 * t.x) + 22 * Math.sin(0.0173 * t.x + 2.1);
+      assert.ok(Math.abs(t.z - roadZ) > 14, `tower ${tx},${tz} clear of the road`);
+    }
+  }
+  assert.ok(found >= 3, `expected several towers in a 7×7 cell grid, got ${found}`);
+});
+
+/* -------------------------------------------------------------- zombies */
+
+test('zombies: damage regions stagger, kill and pay out through the manager', () => {
+  const world = { world: new ColliderWorld({ terrain: () => 0 }), ground: () => 0, terrain: { slopeAt: () => 0 } };
+  const kills = [];
+  const mgr = new ZombieManager({ world, onZombieKilled: (z, info) => kills.push({ z, info }), seed: 42 });
+  const z = mgr.spawnOne({ position: { x: 0, y: 0, z: 0 } }, null, { at: { x: 0, y: 0, z: 0 }, type: 'walker' });
+  assert.ok(z, 'spawned');
+  const r1 = mgr.damageZombie(z, 10, 'limb', new THREE.Vector3(0, 0.6, 0), { x: 0, y: 0, z: -1 });
+  assert.equal(r1.killed, false, '10 damage does not kill a walker');
+  assert.equal(kills.length, 0, 'no kill yet');
+  const r2 = mgr.damageZombie(z, 500, 'head', new THREE.Vector3(0, 1.5, 0), { x: 0, y: 0, z: -1 });
+  assert.equal(r2.killed, true, 'headshot kills');
+  assert.equal(kills.length, 1);
+  assert.equal(kills[0].info.headshot, true, 'headshot flagged');
+  assert.equal(kills[0].info.type, 'walker');
+  const r3 = mgr.damageZombie(z, 50, 'chest');
+  assert.equal(r3.killed, false, 'dead zombies take no further damage');
+});
+
+test('zombies: corpse lingers then recycles to the pool', () => {
+  const world = { world: new ColliderWorld({ terrain: () => 0 }), ground: () => 0, terrain: { slopeAt: () => 0 }, nearestTower: () => null };
+  const mgr = new ZombieManager({ world, seed: 42 });
+  const z = mgr.spawnOne({ position: { x: 0, y: 0, z: 0 } }, null, { at: { x: 0, y: 0, z: 0 }, type: 'crawler' });
+  assert.ok(z, 'spawned');
+  z.kill({ x: 0, z: 1 });
+  assert.ok(!z.alive && z.active, 'corpse present');
+  const player = { position: { x: 0, y: 0, z: 0 }, crouching: false, inTower: false };
+  for (let f = 0; f < Math.ceil((ZOMBIES.corpseTTL + 3) * 60); f++) {
+    mgr.update(DT, { player, night: false, weatherFog: 1, cameraForward: { x: 0, z: 1 } });
+  }
+  assert.ok(!z.active || z.alive, 'corpse released after TTL (parked or pool-reused)');
+});
+
+/* ------------------------------------------------- day/night and weather */
+
+test('dayNight: one day cycles phases and night is dark but defined', () => {
+  const dn = new DayNight({ startPhase: 0 });
+  const phases = [];
+  let night = false;
+  for (let f = 0; f < 60 * DAYNIGHT.dayLength + 10; f++) {
+    const o = dn.update(DT);
+    if (o.isNight) night = true;
+    if (phases[phases.length - 1] !== o.phase) phases.push(o.phase);
+    assert.ok(o.nightFactor >= 0 && o.nightFactor <= 1, 'nightFactor in range');
+    assert.ok(o.sunIntensity > 0.05, 'moonlight keeps night defined');
+    assert.ok(o.exposure > 0.2, 'exposure stays in a renderable range');
+  }
+  assert.ok(night, 'night happens');
+  assert.ok(phases.includes('NIGHT'), `phases seen: ${phases.join(',')}`);
+  assert.match(dn.clockLabel(), /^\d{2}:\d{2}$/, 'clock label format');
+});
+
+test('weather: transitions stay in family and outputs blend continuously', () => {
+  const w = new Weather({ seed: 7 });
+  const states = Object.keys(WEATHER.states);
+  for (const from of states) {
+    const row = WEATHER.chances[from];
+    const sum = Object.values(row).reduce((a, b) => a + b, 0);
+    assert.ok(Math.abs(sum - 1) < 0.02, `${from} row sums to ~1 (${sum.toFixed(2)})`);
+    for (const to of Object.keys(row)) assert.ok(states.includes(to), `${from}→${to} valid`);
+  }
+  let prevFar = null;
+  for (let f = 0; f < 60 * 400; f++) {
+    const o = w.update(DT, { nightFactor: 0.3 });
+    assert.ok(Number.isFinite(o.fogFar + o.dim + o.rain), 'outputs finite');
+    if (prevFar !== null) assert.ok(Math.abs(o.fogFar - prevFar) < 30, 'fog blends, never snaps');
+    prevFar = o.fogFar;
+  }
+  w.setState('STORM');
+  for (let f = 0; f < 60 * WEATHER.transitionTime + 5; f++) w.update(DT, {});
+  assert.equal(Math.round(w.out.rain), 1, 'pinned storm rains');
+});
+
+/* --------------------------------------------------------------- economy */
+
+test('economy: buys gate on coins, drops land, loot rolls stay in the tables', () => {
+  const col = new ColliderWorld({ terrain: () => 0 });
+  const world = {
+    world: col, ground: () => 0, terrain: { slopeAt: () => 0 },
+    probeCylinder: () => true, nearestTower: () => null,
+  };
+  // Economy uses world.world.probeCylinder + world.nearestTower
+  world.world = col;
+  const loot = [];
+  const eco = new Economy({ materials: makeMaterials(), world, onLoot: (i, a) => loot.push([i, a]), seed: 11 });
+  eco.coins = 50;
+  assert.equal(eco.buy('basic').ok, false, 'too poor');
+  eco.coins = 500;
+  const r = eco.buy('weapon');
+  assert.equal(r.ok, true);
+  assert.ok(eco.coins < 500, 'coins spent');
+  assert.equal(eco.buy('basic').ok, true, 'second concurrent drop allowed');
+  for (let f = 0; f < 60 * 30; f++) eco.update(DT, { x: 0, y: 0, z: 0 });
+  const drop = eco.drops.find((d) => d.landed);
+  assert.ok(drop, 'crate landed');
+  const grants = eco.openCrate(eco.crateNear({ x: drop.x, y: 0, z: drop.z }));
+  assert.ok(grants.length >= 1, 'crate yields loot');
+  const valid = new Set(Object.values(ECONOMY.crates).flatMap((c) => c.rolls.map((r2) => r2.item)));
+  for (const [item] of loot) assert.ok(valid.has(item), `loot item ${item} is from a table`);
+  eco.dispose();
+});
+
+/* --------------------------------------------------------------- weapons */
+
+test('loadout: switching cancels reloads and ammo routes to the right pool', () => {
+  const audio = { play: () => {} };
+  const fx = { muzzleFlash: () => {}, eject: () => {}, tracer: () => {} };
+  const lo = new Loadout({ audio, fx, materials: makeMaterials(), kick: () => {} });
+  assert.equal(lo.currentKey, 'rifle');
+  lo.current.state.mag = 0;
+  lo.startReload();
+  assert.ok(lo.current.state.reloading, 'reloading');
+  assert.equal(lo.selectSlot(1), true, 'switch accepted');
+  assert.equal(lo.current.state.reloading, false, 'switch cancelled the reload');
+  const before = lo.weapons.rifle.state.reserve;
+  lo.addAmmo('ammo', 40);
+  assert.equal(lo.weapons.rifle.state.reserve, before + 40, 'ammo feeds the rifle');
+  const mBefore = lo.weapons.marksman.state.reserve;
+  lo.addAmmo('ammoBig', 20);
+  assert.equal(lo.weapons.marksman.state.reserve, mBefore + 20, 'heavy ammo feeds the marksman');
+  const ser = lo.serialize();
+  lo.reset();
+  lo.restore(ser);
+  assert.equal(lo.weapons.rifle.state.reserve, before + 40, 'serialize/restore round-trips');
+});
+
+test('loadout: respects reserve caps', () => {
+  const audio = { play: () => {} };
+  const fx = { muzzleFlash: () => {}, eject: () => {}, tracer: () => {} };
+  const lo = new Loadout({ audio, fx, materials: makeMaterials(), kick: () => {} });
+  lo.addAmmo('ammo', 10000);
+  assert.ok(lo.weapons.rifle.state.reserve <= lo.weapons.rifle.def.reserveMax, 'rifle capped');
+  assert.ok(lo.weapons.sidearm.state.reserve <= lo.weapons.sidearm.def.reserveMax, 'sidearm capped');
+});
+
+/* ---------------------------------------------------------------- rain */
+
+test('rainField: intensity scales the draw range and drops stay finite', async () => {
+  const rain = new RainField({ seed: 5 });
+  const cam = { x: 10, y: 2, z: -7 };
+  const steps = [
+    [0, 0], [0.5, 0.1], [1, 0.5], [0.8, 2.0], // intensity, dt
+  ];
+  for (const [intensity, dt] of steps) {
+    for (let f = 0; f < 300; f++) rain.update(dt, cam, intensity, { x: 0.4, z: -0.2 });
+    const want = intensity > 0.03 ? Math.round(Math.min(1, intensity) * 900) : 0;
+    assert.equal(rain.visibleCount, want, `draw range tracks intensity ${intensity}`);
+    assert.equal(rain.mesh.visible, want > 0);
+    const a = rain.posAttr.array;
+    for (let i = 0; i < want * 6; i++) assert.ok(Number.isFinite(a[i]), `vertex ${i} finite`);
+    // streaks slant with the wind, not straight down
+    if (want > 0) assert.ok(Math.abs(a[3] - a[0]) > 1e-4, 'wind slants the streak');
+  }
+  // the camera can run; drops wrap back into the field box
+  for (let f = 0; f < 600; f++) rain.update(1 / 60, { x: cam.x + f * 0.2, y: cam.y, z: cam.z }, 1, { x: 1, z: 0 });
+  for (let i = 0; i < rain.count; i++) {
+    assert.ok(Math.abs(rain.px[i] - (cam.x + 599 * 0.2)) <= 34 * 1.4 + 1, `drop ${i} wrapped with the camera`);
+  }
+  rain.dispose();
+});
+
+/* -------------------------------------------------------------- towers */
+
+test('towers: config keeps the safe zone honest', () => {
+  assert.ok(TOWERS.enterRadius > 2, 'generous enter radius');
+  assert.ok(TOWERS.regenPerSecond > 0 && TOWERS.regenPerSecond <= 8, 'regen is slow, not god-mode');
+  assert.ok(TOWERS.transitionTime < 2, 'climb transition is brisk');
 });
