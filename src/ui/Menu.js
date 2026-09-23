@@ -111,7 +111,7 @@ export class Menu {
     this.#el('h1', 'title', titleWrap, 'DEADFALL');
     this.#el('div', 'title-sub', titleWrap, 'THE OUTBREAK IS PROCEDURAL. YOUR DEATH IS PERMANENT.');
     const nav = this.#el('div', 'menu-nav', main);
-    nav.appendChild(this.#btn('NEW RUN', 'primary', () => this.h.onPlay?.()));
+    nav.appendChild(this.#btn('PLAY', 'primary', () => this.h.onPlay?.()));
     this.continueBtn = this.#btn('CONTINUE', '', () => this.h.onContinue?.());
     nav.appendChild(this.continueBtn);
     nav.appendChild(this.#btn('SETTINGS', '', () => this.show('settings')));
@@ -120,6 +120,7 @@ export class Menu {
     if (typeof window !== 'undefined' && window.quitAllowed) {
       nav.appendChild(this.#btn('EXIT', '', () => this.h.onExit?.()));
     }
+    this.startupErrorEl = this.#el('div', 'menu-error', main);
     this.#el('div', 'menu-foot', main, 'A PROCEDURAL SURVIVAL PROTOTYPE · MOUSE + KEYBOARD');
 
     /* --------------------------------------------------------- settings */
@@ -243,6 +244,12 @@ export class Menu {
 
   setContinueVisible(visible) {
     this.continueBtn.style.display = visible ? '' : 'none';
+  }
+
+  setStartupError(message = '') {
+    if (!this.startupErrorEl) return;
+    this.startupErrorEl.textContent = message;
+    this.startupErrorEl.classList.toggle('visible', !!message);
   }
 
   setLoadingProgress(p, label) {

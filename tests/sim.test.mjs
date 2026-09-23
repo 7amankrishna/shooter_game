@@ -99,6 +99,12 @@ async function makeGame(seed = 20260917) {
 
 /* ---------------------------------------------------------------- tests */
 
+test('survival: render loop is safe while async init is still loading', () => {
+  const game = new Survival({ engine: {}, input: new FakeInput(), audio: new NullAudio(), hud: new FakeHUD() });
+  assert.doesNotThrow(() => game.update(DT));
+  assert.equal(game.state, 'loading');
+});
+
 test('survival: boots into menu, starts, and the world is standing', async () => {
   const { game, hud } = await makeGame();
   assert.equal(game.state, 'menu');

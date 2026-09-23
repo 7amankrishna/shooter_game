@@ -216,10 +216,16 @@ export class Survival {
     this.inp = input;
     this.inputState = input;
 
+    if (this.state === 'loading') {
+      // init() is async because the initial chunk window is built over several
+      // frames. The render loop can already be alive by then, so never touch
+      // fx/player/world fields until init() has finished wiring them.
+      return;
+    }
     if (this.state !== 'playing') {
       // paused/dead: world keeps breathing behind the overlay (no sim)
-      this.fx.update(dt, this.engine.camera.position);
-      this.#hudSnapshot();
+      this.fx?.update(dt, this.engine.camera.position);
+      if (this.player && this.loadout && this.zombies) this.#hudSnapshot();
       return;
     }
 
