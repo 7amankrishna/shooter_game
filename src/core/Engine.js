@@ -43,6 +43,21 @@ const SKY_FS = /* glsl */ `
   }
 `;
 
+/** Minimal renderer surface used when the browser has no WebGL context. */
+function makeFallbackRenderer() {
+  return {
+    shadowMap: { enabled: false, autoUpdate: false, needsUpdate: false },
+    info: { render: { calls: 0, triangles: 0 } },
+    toneMappingExposure: 1.06,
+    setPixelRatio() {},
+    setSize() {},
+    clear() {},
+    clearDepth() {},
+    render() {},
+    dispose() {},
+  };
+}
+
 export class Engine {
   constructor({ canvas, onFrame, onResize }) {
     this.canvas = canvas;
@@ -76,23 +91,35 @@ export class Engine {
   }
 
   init() {
-    const renderer = new THREE.WebGLRenderer({
-      canvas: this.canvas,
-      antialias: true,
-      powerPreference: 'high-performance',
-      stencil: false,
-    });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, RENDER.maxPixelRatio));
-    renderer.setSize(window.innerWidth, window.innerHeight, false);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.06;
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    // The shadow map is refreshed on a timer / when the follow-grid snaps,
-    // never per frame: the arena is static, so a 10 Hz refresh is invisible.
-    renderer.shadowMap.autoUpdate = false;
-    renderer.shadowMap.needsUpdate = true;
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        canvas: this.canvas,
+        antialias: true,
+        powerPreference: 'high-performance',
+        stencil: false,
+      });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, RENDER.maxPixelRatio));
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.06;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      // The shadow map is refreshed on a timer / when the follow-grid snaps,
+      // never per frame: the arena is static, so a 10 Hz refresh is invisible.
+      renderer.shadowMap.autoUpdate = false;
+      renderer.shadowMap.needsUpdate = true;
+      this.webglAvailable = true;
+    } catch (error) {
+      // A blocked WebGL context used to abort main.js before Menu was built,
+      // which looked like a completely black game. Keep the DOM flow alive so
+      // the user gets the menu (and a useful diagnostic) rather than a blank
+      // page. The headless renderer is only a last-resort UI/simulation mode.
+      console.error('BLACKLINE WebGL initialization failed', error);
+      renderer = makeFallbackRenderer();
+      this.webglAvailable = false;
+    }
     this.shadowInterval = 0.09;
     this._shadowT = 0;
     renderer.autoClear = false;

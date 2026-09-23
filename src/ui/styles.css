@@ -469,6 +469,16 @@ canvas { display: block; }
 .btn.choice { padding: 5px 12px; font-size: 11px; letter-spacing: 2px; }
 .btn.choice.active { border-color: var(--amber); color: var(--amber); }
 
+.menu-error {
+  min-height: 18px;
+  margin-top: 16px;
+  color: var(--blood-bright);
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-align: center;
+  opacity: 0;
+}
+.menu-error.visible { opacity: 1; }
 .menu-foot { position: absolute; bottom: 22px; font-size: 10px; letter-spacing: 3px; color: var(--bone-faint); }
 
 .screen-title { font-size: 22px; letter-spacing: 10px; margin-bottom: 30px; color: var(--bone); }

@@ -25,6 +25,9 @@ const screenRoot = document.getElementById('screens');
 const settings = loadSettings();
 const audio = new AudioEngine();
 const engine = new Engine({ canvas });
+// Keep the menu usable even when a browser refuses to create a WebGL context.
+// Engine.init reports the failure through `engine.webglAvailable`; the menu
+// can then show a useful message instead of leaving the user with a black page.
 engine.init();
 
 const hud = new HUD({ root: uiRoot, camera: engine.camera });
@@ -71,6 +74,10 @@ const menu = new Menu({
   },
 });
 
+if (engine.webglAvailable === false) {
+  menu.setStartupError('WEBGL UNAVAILABLE — 3D RENDERING IS DISABLED');
+}
+
 const input = new InputManager({
   element: canvas,
   onLockChange: (locked) => {
@@ -89,24 +96,46 @@ function startRun(fresh) {
   menu.setLoadingProgress(0.02, 'carving terrain…');
   const tick = () => new Promise((r) => requestAnimationFrame(r));
   (async () => {
-    if (!game) {
-      game = new Survival({ engine, input, audio, hud, seed: Date.now() % 2147483647, settings });
-      await game.init((p) => menu.setLoadingProgress(0.05 + p * 0.9, p < 0.5 ? 'carving terrain…' : 'seeding the dead…'));
-    } else {
-      await tick();
+    try {
+      if (!game) {
+        game = new Survival({ engine, input, audio, hud, seed: Date.now() % 2147483647, settings });
+        // World.build reports (label, fraction). Keep the progress bar honest
+        // instead of multiplying the descriptive label by a number.
+        await game.init((label, p) => menu.setLoadingProgress(
+          0.05 + (Number.isFinite(p) ? p : 0) * 0.9,
+          label || (p < 0.5 ? 'carving terrain…' : 'seeding the dead…'),
+        ));
+      } else {
+        await tick();
+      }
+      menu.setLoadingProgress(1, 'ready');
+      menu.setStartupError('');
+      let ok = true;
+      if (fresh) {
+        game.requestRestart(); // fresh run clears the save
+      } else {
+        ok = game.continueRun();
+      }
+      if (!ok) game.start();
+      hud.hideDeath();
+      menu.hideAll();
+      input.requestLock();
+      started = true;
+    } catch (error) {
+      // A failed WebGL/context or world build must never strand the app on a
+      // blank screen. Leave the menu visible and give the user an actionable
+      // message; the error is still logged for development.
+      console.error('BLACKLINE failed to start a run', error);
+      try {
+        game?.dispose?.();
+      } catch (disposeError) {
+        console.error('BLACKLINE cleanup after startup failure also failed', disposeError);
+      }
+      game = null;
+      started = false;
+      menu.show('main');
+      menu.setStartupError('STARTUP FAILED — RELOAD TO TRY AGAIN');
     }
-    menu.setLoadingProgress(1, 'ready');
-    let ok = true;
-    if (fresh) {
-      game.requestRestart(); // fresh run clears the save
-    } else {
-      ok = game.continueRun();
-    }
-    if (!ok) game.start();
-    hud.hideDeath();
-    menu.hideAll();
-    input.requestLock();
-    started = true;
   })();
 }
 
@@ -163,7 +192,10 @@ uiRoot.addEventListener('click', (e) => {
 let debugOverlay = false;
 
 engine.onFrame = (dt) => {
-  if (!game) return false; // nothing simulated yet — don't even render
+  // startRun assigns `game` before its async world build begins. Do not call
+  // into the partially constructed Survival instance during that window: its
+  // FX/player/world fields are intentionally created by init().
+  if (!game || game.state === 'loading') return false;
 
   // the one true update — Survival samples the input itself and exposes the
   // state as game.inp (sampling twice a frame would eat pressed keys)
