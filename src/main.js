@@ -207,6 +207,24 @@ uiRoot.addEventListener('click', (e) => {
 
 let debugOverlay = false;
 
+// AudioEngine.setListener takes (position, forward, up) vectors, not a camera.
+// Handing it the camera threw on every frame (`forward` was undefined), which
+// aborted onFrame before it could return true, so after PLAY the world never
+// rendered: HUD over a black screen. Scratch vectors keep this allocation-free.
+const listenerPos = new THREE.Vector3();
+const listenerForward = new THREE.Vector3();
+const listenerUp = new THREE.Vector3();
+
+function syncAudioListener(camera) {
+  // getWorldDirection refreshes matrixWorld, so position/up read from it are
+  // this frame's. The camera's own up axis (not the constant camera.up) keeps
+  // HRTF panning right while looking up or down.
+  camera.getWorldDirection(listenerForward);
+  listenerPos.setFromMatrixPosition(camera.matrixWorld);
+  listenerUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+  audio.setListener(listenerPos, listenerForward, listenerUp);
+}
+
 engine.onFrame = (dt) => {
   // startRun assigns `game` before its async world build begins. Do not call
   // into the partially constructed Survival instance during that window: its
@@ -253,7 +271,7 @@ engine.onFrame = (dt) => {
   if (game.state === 'paused') return false; // frozen overlay frame
 
   // spatial audio follows the camera
-  audio.setListener(engine.camera);
+  syncAudioListener(engine.camera);
 
   // streaming-world culling + LOD
   engine.updateWorldCulling(game.world, engine.camera.position);
