@@ -9,9 +9,10 @@ no downloads, no binary files. Three.js + Vite, one dependency.
 ```
 npm install
 npm run dev      # http://localhost:5173
-npm test         # 33 headless tests: physics, world gen, AI, economy, full-run sim, UI
+npm test         # 39 headless tests: physics, world gen, AI, economy, full-run sim, UI, boot → PLAY
 npm run build    # production bundle in dist/
-npm run smoke    # Playwright browser test of the built game (needs `npx playwright install chromium`)
+npm run smoke    # Playwright browser test of the built game (needs `npx playwright install chromium`,
+                 # or CHROMIUM_PATH=/path/to/chrome to use a local browser)
 ```
 
 ## The loop
