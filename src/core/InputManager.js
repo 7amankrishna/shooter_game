@@ -134,15 +134,21 @@ export class InputManager {
   };
 
   _onLockChange = () => {
+    const wasLocked = this.locked;
     this.locked = document.pointerLockElement === this.element;
-    this.onLockChange?.(this.locked);
-    if (!this.locked) this.onUnlock?.();
+    this.onLockChange?.(this.locked, { wasLocked });
+    // A rejected request is not an unlock. Only pause after a lock that was
+    // actually active is lost (important on Vercel/embedded previews where
+    // pointer lock is commonly denied and the mouse fallback is valid).
+    if (!this.locked && wasLocked) this.onUnlock?.();
   };
 
   _onLockError = () => {
+    const wasLocked = this.locked;
     this.locked = false;
     this.lockDenied = true;
-    this.onLockChange?.(false);
+    this.onLockChange?.(false, { wasLocked, denied: true });
+    if (wasLocked) this.onUnlock?.();
   };
 
   requestLock() {
@@ -150,16 +156,34 @@ export class InputManager {
       this.lockDenied = true;
       return false;
     }
+    this.lockDenied = false;
+    const denied = () => {
+      // Keep the run alive. InputManager.sample() deliberately supports mouse
+      // movement, edge assist and Alt+Arrow look without pointer lock.
+      this.lockDenied = true;
+    };
     try {
       const p = this.element.requestPointerLock({ unadjustedMovement: true });
-      if (p?.catch) p.catch(() => { this.lockDenied = true; this.onLockChange?.(false); });
+      if (p?.catch) {
+        p.catch(() => {
+          // A few browsers reject the options overload even though the legacy
+          // request is allowed. Try the legacy form before falling back.
+          try {
+            const fallback = this.element.requestPointerLock();
+            if (fallback?.catch) fallback.catch(denied);
+          } catch {
+            denied();
+          }
+        });
+      }
       return true;
     } catch {
       try {
-        this.element.requestPointerLock();
+        const p = this.element.requestPointerLock();
+        if (p?.catch) p.catch(denied);
         return true;
       } catch {
-        this.lockDenied = true;
+        denied();
         return false;
       }
     }

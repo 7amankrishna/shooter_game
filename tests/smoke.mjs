@@ -64,6 +64,11 @@ uiText.includes('HEALTH') ? ok('HUD vitals rendered') : fail(`HUD vitals missing
 uiText.includes('STAMINA') ? ok('HUD stamina rendered') : fail('HUD stamina missing');
 /ammo|\d+\s*\/\s*\d+/i.test(uiText) ? ok('HUD ammo rendered') : fail(`HUD ammo missing: "${uiText.slice(0, 160)}"`);
 uiText.includes('COINS') || uiText.includes('¤') ? ok('HUD coins rendered') : fail('HUD coins missing');
+// HEALTH/AMMO are also present in the menu's already-built HUD, so verify the
+// gameplay-specific state as well. This catches a Play handler that hides the
+// menu but forgets to transition Survival from its pre-run menu state.
+const crosshairHidden = await page.locator('.crosshair').evaluate((el) => el.classList.contains('hidden')).catch(() => true);
+!crosshairHidden ? ok('PLAY entered the active gameplay state') : fail('PLAY did not enter the active gameplay state');
 
 // the canvas exists and is sized
 const canvas = page.locator('#gl');
