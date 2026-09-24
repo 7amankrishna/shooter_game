@@ -330,7 +330,10 @@ export function getTexture(name, repeat = 1) {
     default:
       throw new Error(`Unknown texture: ${name}`);
   }
-  const out = tex instanceof THREE.Texture ? toTexture(tex, { repeat }) : toTexture(tex, { repeat });
+  // Generators return a canvas, except those that build their own Texture
+  // (bloodsplat): use that as-is. Wrapping it again made a CanvasTexture whose
+  // image was a Texture, which WebGL rejects (texSubImage2D overload error).
+  const out = tex instanceof THREE.Texture ? tex : toTexture(tex, { repeat });
   cache.set(key, out);
   return out;
 }
@@ -361,6 +364,21 @@ export function makeMaterials() {
   M.foliage = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true, vertexColors: true });
   M.rock = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true, vertexColors: true });
   M.sandbag = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true, vertexColors: true });
+  // World.js reads M.organic / M.grass / M.lamp. When they were missing, three
+  // fell back to a default white unlit material: white trees, rocks and grass.
+  // Trees, bushes and rocks share one merged mesh per chunk; their colour is
+  // per vertex (paint()).
+  M.organic = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true, vertexColors: true });
+  // Grass tufts: crossed quads cut out by the blade texture (alpha-tested, so
+  // no sorting). Vertex colour darkens the base.
+  M.grass = new THREE.MeshLambertMaterial({
+    map: getTexture('grassblade'),
+    vertexColors: true,
+    alphaTest: 0.5,
+    side: THREE.DoubleSide,
+  });
+  // Watchtower lamp: unlit, so it reads from a distance at night.
+  M.lamp = new THREE.MeshBasicMaterial({ color: 0xffc46b });
   M.chainlink = new THREE.MeshLambertMaterial({
     map: getTexture('chainlink', 1),
     vertexColors: true,

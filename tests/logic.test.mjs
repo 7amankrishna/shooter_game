@@ -193,6 +193,38 @@ test('world: chunk layout and towers are deterministic and towers avoid roads', 
   assert.ok(found >= 3, `expected several towers in a 7×7 cell grid, got ${found}`);
 });
 
+test('world: every material a streamed chunk uses exists in the library', async () => {
+  // A missing key does not throw: new THREE.Mesh(geo, undefined) quietly uses
+  // three.js' default white unlit material (the white trees/grass bug). Build
+  // through a strict view of the library so an unknown key fails here.
+  const library = makeMaterials();
+  const strict = new Proxy(library, {
+    get(target, key) {
+      if (typeof key === 'string' && !(key in target)) throw new Error(`material "${key}" is not defined in makeMaterials()`);
+      return target[key];
+    },
+  });
+  const world = new World({ materials: strict, seed: 20260917 });
+  await world.build();
+  assert.ok(world.towers.size > 0, 'the starting window includes a watchtower (lamp material)');
+  const meshes = new Set();
+  world.group.traverse((o) => { if (o.isMesh) meshes.add(o.name); });
+  assert.ok(meshes.has('organic') && meshes.has('grass'), 'vegetation and grass meshes were built');
+  world.dispose();
+});
+
+test('textures: every material map wraps a drawable image, never another texture', () => {
+  // getTexture() used to wrap the already-built bloodsplat CanvasTexture in a
+  // second CanvasTexture; WebGL rejected its upload (texSubImage2D overload).
+  let maps = 0;
+  for (const [name, material] of Object.entries(makeMaterials())) {
+    if (!material.map) continue;
+    maps++;
+    assert.ok(material.map.image && !material.map.image.isTexture, `${name}.map.image should be a canvas, not a Texture`);
+  }
+  assert.ok(maps >= 10, `expected the textured materials to be checked, got ${maps}`);
+});
+
 /* -------------------------------------------------------------- zombies */
 
 test('zombies: damage regions stagger, kill and pay out through the manager', () => {
