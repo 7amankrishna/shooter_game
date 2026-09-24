@@ -33,6 +33,7 @@ engine.init();
 const hud = new HUD({ root: uiRoot, camera: engine.camera });
 let game = null; // built after the first PLAY (world gen needs the loading screen)
 let started = false;
+let starting = false;
 
 /* ------------------------------------------------------------- settings */
 
@@ -80,9 +81,11 @@ if (engine.webglAvailable === false) {
 
 const input = new InputManager({
   element: canvas,
-  onLockChange: (locked) => {
-    if (!locked && started && game?.state === 'playing' && !game.buyMenuOpen && !game.adminOpen) {
-      // losing pointer lock mid-run = pause (unless an overlay intentionally took it)
+  onLockChange: (locked, details = {}) => {
+    if (!locked && details.wasLocked && started && game?.state === 'playing' && !game.buyMenuOpen && !game.adminOpen) {
+      // losing pointer lock mid-run = pause (unless an overlay intentionally took it).
+      // A denied initial request is not a pause: the InputManager mouse fallback
+      // keeps the run playable in Vercel previews and restrictive browsers.
       pausePlay();
     }
   },
@@ -92,9 +95,18 @@ input.attach();
 applySettings(settings);
 
 function startRun(fresh) {
+  if (starting) return;
+  starting = true;
+  // This call still runs in the PLAY/CONTINUE click gesture. The request made
+  // after async world generation below may be rejected by browser activation
+  // rules, so acquire it early when possible; gameplay also works without it.
+  input.requestLock();
   menu.show('loading');
   menu.setLoadingProgress(0.02, 'carving terrain…');
-  const tick = () => new Promise((r) => requestAnimationFrame(r));
+  const tick = () => new Promise((r) => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(r);
+    else setTimeout(r, 0);
+  });
   (async () => {
     try {
       if (!game) {
@@ -110,17 +122,19 @@ function startRun(fresh) {
       }
       menu.setLoadingProgress(1, 'ready');
       menu.setStartupError('');
-      let ok = true;
       if (fresh) {
         game.requestRestart(); // fresh run clears the save
-      } else {
-        ok = game.continueRun();
+        game.start();
+      } else if (!game.continueRun()) {
+        // A stale/corrupt save should never leave the menu hidden with a
+        // non-running game behind it. Fall back to a clean run.
+        game.start();
       }
-      if (!ok) game.start();
       hud.hideDeath();
       menu.hideAll();
-      input.requestLock();
+      if (!input.locked) input.requestLock();
       started = true;
+      starting = false;
     } catch (error) {
       // A failed WebGL/context or world build must never strand the app on a
       // blank screen. Leave the menu visible and give the user an actionable
@@ -133,6 +147,8 @@ function startRun(fresh) {
       }
       game = null;
       started = false;
+      starting = false;
+      input.exitLock();
       menu.show('main');
       menu.setStartupError('STARTUP FAILED — RELOAD TO TRY AGAIN');
     }
